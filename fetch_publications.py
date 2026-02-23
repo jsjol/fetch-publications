@@ -301,8 +301,16 @@ def _pdf_url_candidates(pub: dict) -> list[str]:
     return candidates
 
 
-def download_pdf(pub: dict, pub_dir: Path) -> bool:
-    """Download the open-access PDF into *pub_dir*/paper.pdf.  Returns True on success."""
+def download_pdf(pub: dict, pub_dir: Path, force: bool = False) -> bool:
+    """Download the open-access PDF into *pub_dir*/paper.pdf.  Returns True on success.
+
+    When *force* is False (the default) and *paper.pdf* already exists inside
+    *pub_dir*, the download is skipped and True is returned immediately.
+    """
+    pdf_path = pub_dir / "paper.pdf"
+    if not force and pdf_path.exists():
+        print(f"    PDF already exists, skipping → {pdf_path}")
+        return True
     for pdf_url in _pdf_url_candidates(pub):
         try:
             resp = requests.get(pdf_url, headers=_HEADERS, timeout=60, allow_redirects=True)
@@ -343,10 +351,21 @@ def download_pdf(pub: dict, pub_dir: Path) -> bool:
     return False
 
 
-def download_arxiv_source(arxiv_id: str, pub_dir: Path) -> bool:
-    """Download arXiv LaTeX source into *pub_dir*.  Returns True on success."""
+def download_arxiv_source(arxiv_id: str, pub_dir: Path, force: bool = False) -> bool:
+    """Download arXiv LaTeX source into *pub_dir*.  Returns True on success.
+
+    When *force* is False (the default) and *pub_dir* already contains files
+    other than *paper.pdf* (i.e. a previous source download), the download is
+    skipped and True is returned immediately.
+    """
     if not arxiv_id:
         return False
+
+    if not force:
+        existing_source_files = [f for f in pub_dir.iterdir() if f.name != "paper.pdf"]
+        if existing_source_files:
+            print(f"    arXiv source already exists, skipping → {pub_dir}")
+            return True
 
     source_url = f"https://arxiv.org/src/{arxiv_id}"
     try:
@@ -407,6 +426,11 @@ def main() -> None:
         default=".",
         help="Directory in which to write publications.bib and downloaded files (default: current directory)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download files even if they already exist locally",
+    )
     parser.add_argument("--no-pdf", action="store_true", help="Skip PDF downloads")
     parser.add_argument(
         "--no-source", action="store_true", help="Skip LaTeX source downloads"
@@ -454,10 +478,14 @@ def main() -> None:
         print(f"\n[{idx}/{len(publications)}] {raw_title[:80]}")
 
         # Fetch full details (abstract, URLs, …)
+        print("  Fetching full details (may be slow if Scholar is rate-limiting)...",
+              end="", flush=True)
         try:
             pub = scholarly.fill(pub)
+            print(" done.")
             time.sleep(args.delay)
         except Exception as exc:
+            print(f" failed.")
             print(f"  Warning: could not fetch full details: {exc}")
 
         key = make_bibtex_key(pub, used_keys)
@@ -475,10 +503,10 @@ def main() -> None:
             pub_dir.mkdir(parents=True, exist_ok=True)
 
         if not args.no_pdf and pub_dir:
-            download_pdf(pub, pub_dir)
+            download_pdf(pub, pub_dir, force=args.force)
 
         if not args.no_source and arxiv_id and pub_dir:
-            download_arxiv_source(arxiv_id, pub_dir)
+            download_arxiv_source(arxiv_id, pub_dir, force=args.force)
             time.sleep(args.delay)
 
     # Write BibTeX file

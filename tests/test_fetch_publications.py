@@ -493,6 +493,44 @@ def test_download_pdf_no_candidates(tmp_path):
     assert not any(tmp_path.iterdir())
 
 
+# ---------------------------------------------------------------------------
+# download_pdf – skip when already downloaded
+# ---------------------------------------------------------------------------
+
+def test_download_pdf_skips_existing(tmp_path):
+    """download_pdf returns True immediately when paper.pdf already exists."""
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 existing")
+    pub = {"eprint_url": "https://example.com/paper.pdf", "bib": {}}
+
+    with patch("fetch_publications.requests.get") as mock_get:
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    mock_get.assert_not_called()
+    # Existing file should be unchanged
+    assert pdf_path.read_bytes() == b"%PDF-1.4 existing"
+
+
+def test_download_pdf_force_overwrites_existing(tmp_path):
+    """download_pdf re-downloads when force=True even if paper.pdf exists."""
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 old content")
+    pub = {"eprint_url": "https://example.com/paper.pdf", "bib": {}}
+
+    new_content = b"%PDF-1.4 new content"
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/pdf"}
+    mock_response.content = new_content
+
+    with patch("fetch_publications.requests.get", return_value=mock_response):
+        result = download_pdf(pub, tmp_path, force=True)
+
+    assert result is True
+    assert pdf_path.read_bytes() == new_content
+
+
 def test_download_pdf_success(tmp_path):
     pub = {"eprint_url": "https://example.com/paper.pdf", "bib": {}}
     mock_response = MagicMock()
@@ -652,6 +690,62 @@ def test_download_arxiv_source_rejects_path_traversal(tmp_path):
     assert result is True
     assert not (tmp_path.parent / "evil.tex").exists()
     assert (tmp_path / "safe.tex").exists()
+
+
+# ---------------------------------------------------------------------------
+# download_arxiv_source – skip when already downloaded
+# ---------------------------------------------------------------------------
+
+def test_download_arxiv_source_skips_existing(tmp_path):
+    """download_arxiv_source returns True immediately when source files exist."""
+    (tmp_path / "main.tex").write_text("existing source")
+    with patch("fetch_publications.requests.get") as mock_get:
+        result = download_arxiv_source("2105.00001", tmp_path)
+
+    assert result is True
+    mock_get.assert_not_called()
+
+
+def test_download_arxiv_source_skips_when_source_tex_exists(tmp_path):
+    """download_arxiv_source skips when source.tex from a previous run exists."""
+    (tmp_path / "source.tex").write_text("\\documentclass{article}")
+    with patch("fetch_publications.requests.get") as mock_get:
+        result = download_arxiv_source("2105.00002", tmp_path)
+
+    assert result is True
+    mock_get.assert_not_called()
+
+
+def test_download_arxiv_source_does_not_skip_when_only_pdf_present(tmp_path):
+    """paper.pdf alone should not prevent a fresh source download."""
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF-1.4 existing")
+    tex_content = b"\\documentclass{article}"
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/x-tex"}
+    mock_response.content = tex_content
+
+    with patch("fetch_publications.requests.get", return_value=mock_response):
+        result = download_arxiv_source("2105.00003", tmp_path)
+
+    assert result is True
+    assert (tmp_path / "source.tex").exists()
+
+
+def test_download_arxiv_source_force_redownloads(tmp_path):
+    """download_arxiv_source re-downloads when force=True even if source exists."""
+    (tmp_path / "source.tex").write_text("old source")
+    new_content = b"\\documentclass{article} new"
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/x-tex"}
+    mock_response.content = new_content
+
+    with patch("fetch_publications.requests.get", return_value=mock_response):
+        result = download_arxiv_source("2105.00004", tmp_path, force=True)
+
+    assert result is True
+    assert (tmp_path / "source.tex").read_bytes() == new_content
 
 
 # ---------------------------------------------------------------------------
