@@ -1,4 +1,4 @@
-# update-publications
+# Fetch publications from Google Scholar
 
 A Python script that reads a Google Scholar profile URL, fetches all
 publications, and:
