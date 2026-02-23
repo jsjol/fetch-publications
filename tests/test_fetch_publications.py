@@ -330,7 +330,53 @@ def test_to_pdf_url_pmlr_html():
     assert url in urls  # fallback preserved
 
 
-def test_pdf_url_candidates_openreview_pub_url():
+def test_to_pdf_url_diva_record():
+    url = "https://www.diva-portal.org/smash/record.jsf?pid=diva2%3A1638041&dswid=8847"
+    pub = {}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == "https://www.diva-portal.org/smash/get/diva2:1638041/FULLTEXT01.pdf"
+    assert url in urls  # fallback preserved
+
+
+def test_to_pdf_url_diva_record_unencoded_pid():
+    """DiVA pid without URL-encoding should still work."""
+    url = "https://www.diva-portal.org/smash/record.jsf?pid=diva2:9999999"
+    pub = {}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == "https://www.diva-portal.org/smash/get/diva2:9999999/FULLTEXT01.pdf"
+
+
+def test_pdf_url_candidates_diva_pub_url():
+    url = "https://www.diva-portal.org/smash/record.jsf?pid=diva2%3A1638041&dswid=8847"
+    pub = {"eprint_url": "", "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert any("FULLTEXT01.pdf" in c for c in cands)
+
+
+def test_download_pdf_diva_uses_fulltext_url(tmp_path):
+    """DiVA record URL should be converted to FULLTEXT01.pdf URL."""
+    record_url = "https://www.diva-portal.org/smash/record.jsf?pid=diva2%3A1638041&dswid=8847"
+    pub = {"eprint_url": record_url, "bib": {}}
+
+    expected_pdf_url = "https://www.diva-portal.org/smash/get/diva2:1638041/FULLTEXT01.pdf"
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append(url)
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.headers = {"Content-Type": "application/pdf"}
+        mock.content = b"%PDF-1.4 diva pdf"
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert captured[0] == expected_pdf_url
+    assert (tmp_path / "paper.pdf").exists()
+
+
     url = "https://openreview.net/forum?id=SomeId123"
     pub = {"eprint_url": "", "pub_url": url}
     cands = _pdf_url_candidates(pub)

@@ -20,6 +20,7 @@ import sys
 import tarfile
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from scholarly import scholarly
@@ -199,6 +200,7 @@ def _is_pdf_response(resp: requests.Response) -> bool:
 _BIORXIV_RE = re.compile(r"(biorxiv|medrxiv)\.org/content/", re.IGNORECASE)
 _OPENREVIEW_RE = re.compile(r"openreview\.net/forum\?", re.IGNORECASE)
 _PMLR_RE = re.compile(r"proceedings\.mlr\.press/.*\.html$", re.IGNORECASE)
+_DIVA_RE = re.compile(r"diva-portal\.org/smash/record\.jsf", re.IGNORECASE)
 
 
 def _to_pdf_url(url: str, pub: dict) -> list[str]:
@@ -209,6 +211,7 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
     * bioRxiv / medRxiv abstract → ``.full.pdf`` URL (with original as fallback)
     * OpenReview forum page → PDF page
     * PMLR HTML paper page → PDF URL
+    * DiVA portal record page → FULLTEXT01.pdf URL (with original as fallback)
     * All other URLs are returned unchanged (may already be direct PDF links).
     """
     if not url:
@@ -229,6 +232,18 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
         # Convert .html to .pdf; keep original as fallback
         pdf_url = re.sub(r"\.html$", ".pdf", url, flags=re.IGNORECASE)
         return [pdf_url, url]
+    if _DIVA_RE.search(url):
+        # DiVA portal: extract diva2:XXXXXX from the ?pid= query parameter and
+        # construct the FULLTEXT01.pdf URL.
+        # E.g. record.jsf?pid=diva2%3A1638041 -> get/diva2:1638041/FULLTEXT01.pdf
+        qs = parse_qs(urlparse(url).query)
+        pid_values = qs.get("pid", [])
+        if pid_values:
+            diva_id = unquote(pid_values[0])  # e.g. "diva2:1638041"
+            base = re.match(r"(https?://[^/]+)", url, re.IGNORECASE)
+            if base:
+                pdf_url = f"{base.group(1)}/smash/get/{diva_id}/FULLTEXT01.pdf"
+                return [pdf_url, url]
     return [url]
 
 
@@ -260,6 +275,7 @@ def _pdf_url_candidates(pub: dict) -> list[str]:
             or _BIORXIV_RE.search(pub_url)
             or _OPENREVIEW_RE.search(pub_url)
             or _PMLR_RE.search(pub_url)
+            or _DIVA_RE.search(pub_url)
             or pub_url.lower().endswith(".pdf")
         )
         if is_open_access or is_known_pattern:
