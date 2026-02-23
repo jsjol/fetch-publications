@@ -21,6 +21,7 @@ from fetch_publications import (
     _is_pdf_response,
     _pdf_url_candidates,
     _to_pdf_url,
+    _extract_patent_pdf_url,
 )
 
 
@@ -650,3 +651,103 @@ def test_download_arxiv_source_rejects_path_traversal(tmp_path):
     assert result is True
     assert not (tmp_path.parent / "evil.tex").exists()
     assert (tmp_path / "safe.tex").exists()
+
+
+# ---------------------------------------------------------------------------
+# Google Patents support
+# ---------------------------------------------------------------------------
+
+_SAMPLE_PATENT_HTML = """
+<html><body>
+<a href="https://patentimages.storage.googleapis.com/97/b7/3e/0c8d65e3a3a6da/US10046177.pdf"
+   download="" title="Download PDF">Download PDF</a>
+</body></html>
+"""
+
+_PATENT_PDF_URL = (
+    "https://patentimages.storage.googleapis.com/97/b7/3e/0c8d65e3a3a6da/US10046177.pdf"
+)
+
+
+def test_extract_patent_pdf_url_found():
+    """Should extract patentimages PDF URL from a Google Patents HTML page."""
+    assert _extract_patent_pdf_url(_SAMPLE_PATENT_HTML) == _PATENT_PDF_URL
+
+
+def test_extract_patent_pdf_url_not_found():
+    """Should return empty string when no patentimages URL is present."""
+    assert _extract_patent_pdf_url("<html><body>No PDF here</body></html>") == ""
+
+
+def test_pdf_url_candidates_includes_patent_pub_url():
+    """patents.google.com URL should be included in candidates as a known pattern."""
+    patent_url = "https://patents.google.com/patent/US10046177B2/en"
+    pub = {"eprint_url": "", "pub_url": patent_url}
+    cands = _pdf_url_candidates(pub)
+    assert patent_url in cands
+
+
+def test_pdf_url_candidates_patent_eprint_url():
+    """Patent URL in eprint_url should also be included in candidates."""
+    patent_url = "https://patents.google.com/patent/US10046177B2/en"
+    pub = {"eprint_url": patent_url, "pub_url": ""}
+    cands = _pdf_url_candidates(pub)
+    assert patent_url in cands
+
+
+def test_to_pdf_url_patent_returns_url_unchanged():
+    """_to_pdf_url should return the patent page URL as-is (scraping happens later)."""
+    patent_url = "https://patents.google.com/patent/US10046177B2/en"
+    urls = _to_pdf_url(patent_url, {})
+    assert patent_url in urls
+
+
+def test_download_pdf_patent_scrapes_and_downloads(tmp_path):
+    """download_pdf should fetch the patent page, extract the PDF link, and save it."""
+    patent_url = "https://patents.google.com/patent/US10046177B2/en"
+    pub = {"eprint_url": "", "pub_url": patent_url, "bib": {}}
+
+    call_log = []
+
+    def fake_get(url, **kwargs):
+        call_log.append(url)
+        mock = MagicMock()
+        if _PATENT_PDF_URL in url:
+            mock.status_code = 200
+            mock.headers = {"Content-Type": "application/pdf"}
+            mock.content = b"%PDF-1.4 patent pdf"
+        else:
+            # Return the patent HTML page
+            mock.status_code = 200
+            mock.headers = {"Content-Type": "text/html"}
+            mock.content = _SAMPLE_PATENT_HTML.encode()
+            mock.text = _SAMPLE_PATENT_HTML
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert (tmp_path / "paper.pdf").exists()
+    # First request should be the patent page, second the actual PDF
+    assert any(u.startswith("https://patents.google.com/") for u in call_log)
+    assert any(u.startswith("https://patentimages.storage.googleapis.com/") for u in call_log)
+
+
+def test_download_pdf_patent_no_pdf_link_in_page(tmp_path):
+    """When no PDF link is found in the patent page, download_pdf returns False."""
+    patent_url = "https://patents.google.com/patent/US10046177B2/en"
+    pub = {"eprint_url": "", "pub_url": patent_url, "bib": {}}
+
+    def fake_get(url, **kwargs):
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.headers = {"Content-Type": "text/html"}
+        mock.content = b"<html><body>No PDF link here</body></html>"
+        mock.text = "<html><body>No PDF link here</body></html>"
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is False
