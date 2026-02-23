@@ -378,6 +378,7 @@ def test_download_pdf_diva_uses_fulltext_url(tmp_path):
     assert (tmp_path / "paper.pdf").exists()
 
 
+def test_pdf_url_candidates_openreview_pub_url():
     url = "https://openreview.net/forum?id=SomeId123"
     pub = {"eprint_url": "", "pub_url": url}
     cands = _pdf_url_candidates(pub)
