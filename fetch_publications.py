@@ -437,10 +437,14 @@ def main() -> None:
         print(f"\n[{idx}/{len(publications)}] {raw_title[:80]}")
 
         # Fetch full details (abstract, URLs, …)
+        print("  Fetching full details (may be slow if Scholar is rate-limiting)...",
+              end="", flush=True)
         try:
             pub = scholarly.fill(pub)
+            print(" done.")
             time.sleep(args.delay)
         except Exception as exc:
+            print(f" failed.")
             print(f"  Warning: could not fetch full details: {exc}")
 
         key = make_bibtex_key(pub, used_keys)
