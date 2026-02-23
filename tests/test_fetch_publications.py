@@ -311,8 +311,82 @@ def test_pdf_url_candidates_no_duplicates():
 
 
 # ---------------------------------------------------------------------------
-# download_pdf  – bioRxiv fallback chain (mocked)
+# _to_pdf_url  (OpenReview / PMLR conversion)
 # ---------------------------------------------------------------------------
+
+def test_to_pdf_url_openreview_forum():
+    url = "https://openreview.net/forum?id=AbcDefGhIjK"
+    pub = {}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == "https://openreview.net/pdf?id=AbcDefGhIjK"
+    assert url in urls  # fallback preserved
+
+
+def test_to_pdf_url_pmlr_html():
+    url = "https://proceedings.mlr.press/v235/doe24a.html"
+    pub = {}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == "https://proceedings.mlr.press/v235/doe24a.pdf"
+    assert url in urls  # fallback preserved
+
+
+def test_pdf_url_candidates_openreview_pub_url():
+    url = "https://openreview.net/forum?id=SomeId123"
+    pub = {"eprint_url": "", "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert any("openreview.net/pdf" in c for c in cands)
+
+
+def test_pdf_url_candidates_pmlr_pub_url():
+    url = "https://proceedings.mlr.press/v100/smith20a.html"
+    pub = {"eprint_url": "", "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert any(c.endswith(".pdf") for c in cands)
+
+
+# ---------------------------------------------------------------------------
+# _pdf_url_candidates  – public_access fallback
+# ---------------------------------------------------------------------------
+
+def test_pdf_url_candidates_public_access_uses_pub_url():
+    """When public_access=True and eprint_url is absent, pub_url should be tried."""
+    pub_url = "https://some-repo.example.com/papers/paper123"
+    pub = {"eprint_url": "", "pub_url": pub_url, "public_access": True}
+    cands = _pdf_url_candidates(pub)
+    assert pub_url in cands
+
+
+def test_pdf_url_candidates_no_public_access_generic_url_excluded():
+    """Generic pub_url without public_access flag should NOT be added."""
+    pub_url = "https://some-repo.example.com/papers/paper123"
+    pub = {"eprint_url": "", "pub_url": pub_url, "public_access": False}
+    cands = _pdf_url_candidates(pub)
+    assert pub_url not in cands
+
+
+def test_download_pdf_public_access_tries_pub_url(tmp_path):
+    """When public_access=True, pub_url should be tried even without eprint_url."""
+    pub_url = "https://some-repo.example.com/paper"
+    pub = {"eprint_url": "", "pub_url": pub_url, "public_access": True, "bib": {}}
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/pdf"}
+    mock_response.content = b"%PDF-1.4 open access pdf"
+
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append(url)
+        return mock_response
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert pub_url in captured
+    assert (tmp_path / "paper.pdf").exists()
+
 
 def test_download_pdf_biorxiv_uses_full_pdf_url(tmp_path):
     """bioRxiv eprint_url should be converted to .full.pdf URL."""

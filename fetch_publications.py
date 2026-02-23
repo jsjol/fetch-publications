@@ -197,15 +197,19 @@ def _is_pdf_response(resp: requests.Response) -> bool:
 
 
 _BIORXIV_RE = re.compile(r"(biorxiv|medrxiv)\.org/content/", re.IGNORECASE)
+_OPENREVIEW_RE = re.compile(r"openreview\.net/forum\?", re.IGNORECASE)
+_PMLR_RE = re.compile(r"proceedings\.mlr\.press/.*\.html$", re.IGNORECASE)
 
 
 def _to_pdf_url(url: str, pub: dict) -> list[str]:
     """Return a list of concrete PDF URL(s) derived from *url*.
 
-    Handles known preprint server patterns:
+    Handles known preprint/venue patterns:
     * arXiv abstract → direct PDF URL
     * bioRxiv / medRxiv abstract → ``.full.pdf`` URL (with original as fallback)
-    * All other URLs are returned unchanged (may be direct PDF links).
+    * OpenReview forum page → PDF page
+    * PMLR HTML paper page → PDF URL
+    * All other URLs are returned unchanged (may already be direct PDF links).
     """
     if not url:
         return []
@@ -217,11 +221,24 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
         pdf_url = url.rstrip("/") + ".full.pdf"
         # Also keep the original as fallback in case the server redirects
         return [pdf_url, url]
+    if _OPENREVIEW_RE.search(url):
+        # Convert forum?id=X to pdf?id=X; keep original as fallback
+        pdf_url = re.sub(r"forum\?", "pdf?", url, flags=re.IGNORECASE)
+        return [pdf_url, url]
+    if _PMLR_RE.search(url):
+        # Convert .html to .pdf; keep original as fallback
+        pdf_url = re.sub(r"\.html$", ".pdf", url, flags=re.IGNORECASE)
+        return [pdf_url, url]
     return [url]
 
 
 def _pdf_url_candidates(pub: dict) -> list[str]:
-    """Return a list of URLs to try in order when looking for a PDF."""
+    """Return a list of URLs to try in order when looking for a PDF.
+
+    When Google Scholar marks a paper as publicly accessible (``public_access``
+    is True) but ``eprint_url`` is absent, we fall back to ``pub_url``
+    unconditionally — ``_is_pdf_response`` will reject non-PDF responses.
+    """
     seen: set[str] = set()
     candidates: list[str] = []
 
@@ -233,14 +250,19 @@ def _pdf_url_candidates(pub: dict) -> list[str]:
     for url in _to_pdf_url(pub.get("eprint_url", ""), pub):
         add(url)
 
-    # Use pub_url as a secondary candidate for known open-access patterns
     pub_url = pub.get("pub_url", "")
     if pub_url:
-        if (
+        # Always try pub_url when Google Scholar marks the paper as open access,
+        # or when the URL already looks like a direct PDF / known preprint server.
+        is_open_access = bool(pub.get("public_access"))
+        is_known_pattern = (
             re.search(r"arxiv\.org/", pub_url, re.IGNORECASE)
             or _BIORXIV_RE.search(pub_url)
+            or _OPENREVIEW_RE.search(pub_url)
+            or _PMLR_RE.search(pub_url)
             or pub_url.lower().endswith(".pdf")
-        ):
+        )
+        if is_open_access or is_known_pattern:
             for url in _to_pdf_url(pub_url, pub):
                 add(url)
 
