@@ -81,18 +81,37 @@ def _escape_bibtex(value: str) -> str:
 
 
 def format_bibtex(pub: dict, key: str) -> str:
-    """Return a BibTeX entry string for *pub* using cite-key *key*."""
+    """Return a BibTeX entry string for *pub* using cite-key *key*.
+
+    scholarly fills ``bib['journal']`` and ``bib['conference']`` for
+    AUTHOR_PUBLICATION_ENTRY publications (filled from the detail page).
+    ``bib['venue']`` is the abbreviated venue from the author-page snippet.
+    We prefer the explicit journal/conference fields when available.
+    """
     bib = pub.get("bib", {})
 
-    venue = bib.get("venue", "").lower()
-    if any(kw in venue for kw in ("conference", "proceedings", "workshop", "symposium")):
+    journal = bib.get("journal", "")
+    conference = bib.get("conference", "")
+    venue = bib.get("venue", "")
+
+    if conference:
         entry_type = "inproceedings"
-    elif "thesis" in venue:
-        entry_type = "phdthesis"
-    elif "book" in venue:
-        entry_type = "book"
-    else:
+        venue_name = conference
+    elif journal:
         entry_type = "article"
+        venue_name = journal
+    else:
+        # Fall back to venue-string heuristics (PUBLICATION_SEARCH_SNIPPET)
+        venue_lower = venue.lower()
+        if any(kw in venue_lower for kw in ("conference", "proceedings", "workshop", "symposium")):
+            entry_type = "inproceedings"
+        elif "thesis" in venue_lower:
+            entry_type = "phdthesis"
+        elif "book" in venue_lower:
+            entry_type = "book"
+        else:
+            entry_type = "article"
+        venue_name = venue
 
     lines = [f"@{entry_type}{{{key},"]
 
@@ -109,9 +128,9 @@ def format_bibtex(pub: dict, key: str) -> str:
     add_field("year", str(bib.get("pub_year", "")))
 
     if entry_type == "inproceedings":
-        add_field("booktitle", bib.get("venue", ""))
+        add_field("booktitle", venue_name)
     else:
-        add_field("journal", bib.get("venue", ""))
+        add_field("journal", venue_name)
 
     add_field("volume", bib.get("volume", ""))
     add_field("number", bib.get("number", ""))
@@ -167,28 +186,58 @@ def extract_arxiv_id(pub: dict) -> str:
 _HEADERS = {"User-Agent": "PublicationsFetcher/1.0 (https://github.com/jsjol/update-publications)"}
 
 
+def _is_pdf_response(resp: requests.Response) -> bool:
+    """Return True when *resp* looks like a PDF (by Content-Type or magic bytes)."""
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "pdf" in content_type:
+        return True
+    # Some servers use application/octet-stream or omit the type entirely.
+    # Fall back to checking the PDF magic bytes.
+    return resp.content[:4] == b"%PDF"
+
+
+def _pdf_url_candidates(pub: dict) -> list[str]:
+    """Return a list of URLs to try in order when looking for a PDF."""
+    candidates: list[str] = []
+
+    eprint = pub.get("eprint_url", "")
+    if eprint:
+        # arXiv: convert abstract URL to direct PDF URL
+        if re.search(r"arxiv\.org/abs/", eprint, re.IGNORECASE):
+            arxiv_id = extract_arxiv_id(pub)
+            candidates.append(f"https://arxiv.org/pdf/{arxiv_id}.pdf")
+        else:
+            candidates.append(eprint)
+
+    # Use pub_url as a secondary candidate when it looks like a direct PDF
+    pub_url = pub.get("pub_url", "")
+    if pub_url and pub_url not in candidates:
+        if pub_url.lower().endswith(".pdf") or re.search(r"arxiv\.org/", pub_url, re.IGNORECASE):
+            if re.search(r"arxiv\.org/abs/", pub_url, re.IGNORECASE):
+                arxiv_id = extract_arxiv_id(pub)
+                url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                if url not in candidates:
+                    candidates.append(url)
+            else:
+                candidates.append(pub_url)
+
+    return candidates
+
+
 def download_pdf(pub: dict, pub_dir: Path) -> bool:
     """Download the open-access PDF into *pub_dir*/paper.pdf.  Returns True on success."""
-    pdf_url = pub.get("eprint_url", "")
-    if not pdf_url:
-        return False
-
-    # arXiv: convert abstract URL to PDF URL
-    if re.search(r"arxiv\.org/abs/", pdf_url, re.IGNORECASE):
-        arxiv_id = extract_arxiv_id(pub)
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-
-    try:
-        resp = requests.get(pdf_url, headers=_HEADERS, timeout=60, allow_redirects=True)
-        content_type = resp.headers.get("Content-Type", "")
-        if resp.status_code == 200 and "pdf" in content_type.lower():
-            pdf_path = pub_dir / "paper.pdf"
-            pdf_path.write_bytes(resp.content)
-            print(f"    PDF saved → {pdf_path}")
-            return True
-        print(f"    PDF not available (status {resp.status_code}, content-type: {content_type})")
-    except requests.RequestException as exc:
-        print(f"    Warning: PDF download failed: {exc}")
+    for pdf_url in _pdf_url_candidates(pub):
+        try:
+            resp = requests.get(pdf_url, headers=_HEADERS, timeout=60, allow_redirects=True)
+            if resp.status_code == 200 and _is_pdf_response(resp):
+                pdf_path = pub_dir / "paper.pdf"
+                pdf_path.write_bytes(resp.content)
+                print(f"    PDF saved → {pdf_path}")
+                return True
+            print(f"    PDF not available at {pdf_url} (status {resp.status_code}, "
+                  f"content-type: {resp.headers.get('Content-Type', '')})")
+        except requests.RequestException as exc:
+            print(f"    Warning: PDF download failed for {pdf_url}: {exc}")
     return False
 
 
@@ -315,7 +364,7 @@ def main() -> None:
         arxiv_id = extract_arxiv_id(pub)
 
         # Decide whether we need a per-paper directory
-        need_dir = (not args.no_pdf and pub.get("eprint_url")) or (
+        need_dir = (not args.no_pdf and bool(_pdf_url_candidates(pub))) or (
             not args.no_source and arxiv_id
         )
         pub_dir: Path | None = None

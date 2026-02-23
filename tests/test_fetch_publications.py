@@ -18,6 +18,8 @@ from fetch_publications import (
     extract_arxiv_id,
     download_pdf,
     download_arxiv_source,
+    _is_pdf_response,
+    _pdf_url_candidates,
 )
 
 
@@ -140,6 +142,7 @@ def test_format_bibtex_includes_abstract():
 
 
 def test_format_bibtex_conference_uses_inproceedings():
+    """venue-string heuristic (PUBLICATION_SEARCH_SNIPPET path)."""
     pub = {"bib": {"title": "Conference Paper", "venue": "International Conference on ML"}}
     entry = format_bibtex(pub, "key1")
     assert entry.startswith("@inproceedings{")
@@ -149,6 +152,40 @@ def test_format_bibtex_article_type():
     pub = {"bib": {"title": "Journal Paper", "venue": "Nature"}}
     entry = format_bibtex(pub, "key1")
     assert entry.startswith("@article{")
+
+
+def test_format_bibtex_bib_journal_field():
+    """scholarly fills bib['journal'] for AUTHOR_PUBLICATION_ENTRY; use it as journal field."""
+    pub = {"bib": {"title": "Journal Article", "journal": "Nature Communications"}}
+    entry = format_bibtex(pub, "key1")
+    assert entry.startswith("@article{")
+    assert "Nature Communications" in entry
+    assert "journal = {Nature Communications}" in entry
+
+
+def test_format_bibtex_bib_conference_field():
+    """scholarly fills bib['conference'] for AUTHOR_PUBLICATION_ENTRY; use it as booktitle."""
+    pub = {"bib": {"title": "Conf Paper", "conference": "NeurIPS 2023"}}
+    entry = format_bibtex(pub, "key1")
+    assert entry.startswith("@inproceedings{")
+    assert "NeurIPS 2023" in entry
+    assert "booktitle = {NeurIPS 2023}" in entry
+
+
+def test_format_bibtex_conference_field_preferred_over_venue():
+    """bib['conference'] should take precedence over venue string."""
+    pub = {"bib": {"title": "Paper", "conference": "ICML 2022", "venue": "ICML"}}
+    entry = format_bibtex(pub, "key1")
+    assert entry.startswith("@inproceedings{")
+    assert "ICML 2022" in entry
+
+
+def test_format_bibtex_journal_field_preferred_over_venue():
+    """bib['journal'] should take precedence over venue string."""
+    pub = {"bib": {"title": "Paper", "journal": "Science", "venue": "Sci"}}
+    entry = format_bibtex(pub, "key1")
+    assert entry.startswith("@article{")
+    assert "journal = {Science}" in entry
 
 
 def test_format_bibtex_arxiv_fields():
@@ -170,11 +207,64 @@ def test_format_bibtex_title_case_protected():
 
 
 # ---------------------------------------------------------------------------
+# _is_pdf_response
+# ---------------------------------------------------------------------------
+
+def test_is_pdf_response_by_content_type():
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Content-Type": "application/pdf"}
+    mock_resp.content = b"not real pdf"
+    assert _is_pdf_response(mock_resp) is True
+
+
+def test_is_pdf_response_by_magic_bytes():
+    """Accept application/octet-stream when content starts with %PDF magic bytes."""
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Content-Type": "application/octet-stream"}
+    mock_resp.content = b"%PDF-1.4 fake content"
+    assert _is_pdf_response(mock_resp) is True
+
+
+def test_is_pdf_response_rejects_html():
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Content-Type": "text/html"}
+    mock_resp.content = b"<html></html>"
+    assert _is_pdf_response(mock_resp) is False
+
+
+# ---------------------------------------------------------------------------
+# _pdf_url_candidates
+# ---------------------------------------------------------------------------
+
+def test_pdf_url_candidates_eprint_url():
+    pub = {"eprint_url": "https://example.com/paper.pdf"}
+    assert "https://example.com/paper.pdf" in _pdf_url_candidates(pub)
+
+
+def test_pdf_url_candidates_arxiv_abs_converted():
+    pub = {"eprint_url": "https://arxiv.org/abs/2301.12345"}
+    cands = _pdf_url_candidates(pub)
+    assert any("arxiv.org/pdf/" in c for c in cands)
+    assert not any("arxiv.org/abs/" in c for c in cands)
+
+
+def test_pdf_url_candidates_pub_url_pdf_extension():
+    pub = {"eprint_url": "", "pub_url": "https://example.com/paper.pdf"}
+    cands = _pdf_url_candidates(pub)
+    assert "https://example.com/paper.pdf" in cands
+
+
+def test_pdf_url_candidates_empty():
+    pub = {"eprint_url": "", "pub_url": "https://example.com/page"}
+    assert _pdf_url_candidates(pub) == []
+
+
+# ---------------------------------------------------------------------------
 # download_pdf (mocked)
 # ---------------------------------------------------------------------------
 
-def test_download_pdf_no_eprint_url(tmp_path):
-    pub = {"bib": {}, "eprint_url": ""}
+def test_download_pdf_no_candidates(tmp_path):
+    pub = {"bib": {}, "eprint_url": "", "pub_url": "https://example.com/abstract"}
     result = download_pdf(pub, tmp_path)
     assert result is False
     assert not any(tmp_path.iterdir())
@@ -186,6 +276,21 @@ def test_download_pdf_success(tmp_path):
     mock_response.status_code = 200
     mock_response.headers = {"Content-Type": "application/pdf"}
     mock_response.content = b"%PDF-1.4 fake pdf content"
+
+    with patch("fetch_publications.requests.get", return_value=mock_response):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert (tmp_path / "paper.pdf").exists()
+
+
+def test_download_pdf_octet_stream_with_magic_bytes(tmp_path):
+    """PDF served with application/octet-stream should still be saved."""
+    pub = {"eprint_url": "https://example.com/paper", "bib": {}}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/octet-stream"}
+    mock_response.content = b"%PDF-1.4 actual pdf"
 
     with patch("fetch_publications.requests.get", return_value=mock_response):
         result = download_pdf(pub, tmp_path)
@@ -225,6 +330,21 @@ def test_download_pdf_converts_arxiv_abs_to_pdf_url(tmp_path):
 
     assert "arxiv.org/pdf/" in captured_url[0]
     assert "abs" not in captured_url[0]
+
+
+def test_download_pdf_fallback_to_pub_url(tmp_path):
+    """When eprint_url is absent, fall back to pub_url if it ends with .pdf."""
+    pub = {"eprint_url": "", "pub_url": "https://example.com/paper.pdf", "bib": {}}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/pdf"}
+    mock_response.content = b"%PDF-1.4 fake"
+
+    with patch("fetch_publications.requests.get", return_value=mock_response):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert (tmp_path / "paper.pdf").exists()
 
 
 # ---------------------------------------------------------------------------
