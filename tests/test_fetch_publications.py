@@ -20,6 +20,7 @@ from fetch_publications import (
     download_arxiv_source,
     _is_pdf_response,
     _pdf_url_candidates,
+    _to_pdf_url,
 )
 
 
@@ -260,8 +261,108 @@ def test_pdf_url_candidates_empty():
 
 
 # ---------------------------------------------------------------------------
-# download_pdf (mocked)
+# _to_pdf_url  (bioRxiv / medRxiv conversion)
 # ---------------------------------------------------------------------------
+
+def test_to_pdf_url_biorxiv_abstract():
+    url = "https://www.biorxiv.org/content/10.1101/2020.01.01.123456"
+    pub = {"eprint_url": url, "pub_url": ""}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == url + ".full.pdf"
+
+
+def test_to_pdf_url_biorxiv_with_version():
+    url = "https://www.biorxiv.org/content/10.1101/2020.01.01.123456v3"
+    pub = {"eprint_url": url, "pub_url": ""}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == url + ".full.pdf"
+
+
+def test_to_pdf_url_medrxiv():
+    url = "https://www.medrxiv.org/content/10.1101/2021.06.01.12345678"
+    pub = {"eprint_url": url, "pub_url": ""}
+    urls = _to_pdf_url(url, pub)
+    assert urls[0] == url + ".full.pdf"
+    # Original URL kept as fallback
+    assert url in urls
+
+
+def test_pdf_url_candidates_biorxiv_eprint_url():
+    url = "https://www.biorxiv.org/content/10.1101/2020.01.01.123456v2"
+    pub = {"eprint_url": url, "pub_url": ""}
+    cands = _pdf_url_candidates(pub)
+    assert cands[0] == url + ".full.pdf"
+    assert url in cands  # fallback preserved
+
+
+def test_pdf_url_candidates_biorxiv_pub_url():
+    url = "https://www.biorxiv.org/content/10.1101/2020.01.01.123456"
+    pub = {"eprint_url": "", "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert any(".full.pdf" in c for c in cands)
+
+
+def test_pdf_url_candidates_no_duplicates():
+    """Same URL should not appear twice even if eprint_url == pub_url."""
+    url = "https://arxiv.org/pdf/2301.00001.pdf"
+    pub = {"eprint_url": url, "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert len(cands) == len(set(cands))
+
+
+# ---------------------------------------------------------------------------
+# download_pdf  – bioRxiv fallback chain (mocked)
+# ---------------------------------------------------------------------------
+
+def test_download_pdf_biorxiv_uses_full_pdf_url(tmp_path):
+    """bioRxiv eprint_url should be converted to .full.pdf URL."""
+    abstract_url = "https://www.biorxiv.org/content/10.1101/2020.01.01.123456"
+    pub = {"eprint_url": abstract_url, "bib": {}}
+
+    pdf_url = abstract_url + ".full.pdf"
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append(url)
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.headers = {"Content-Type": "application/pdf"}
+        mock.content = b"%PDF-1.4 biorxiv"
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert captured[0] == pdf_url
+    assert (tmp_path / "paper.pdf").exists()
+
+
+def test_download_pdf_biorxiv_falls_back_when_full_pdf_missing(tmp_path):
+    """When .full.pdf returns non-PDF, fall back to the original URL."""
+    abstract_url = "https://www.biorxiv.org/content/10.1101/2020.01.01.111111"
+    pub = {"eprint_url": abstract_url, "bib": {}}
+
+    def fake_get(url, **kwargs):
+        mock = MagicMock()
+        if url.endswith(".full.pdf"):
+            # First attempt – HTML (abstract page served instead of PDF)
+            mock.status_code = 200
+            mock.headers = {"Content-Type": "text/html"}
+            mock.content = b"<html>abstract</html>"
+        else:
+            # Fallback – redirect to actual PDF
+            mock.status_code = 200
+            mock.headers = {"Content-Type": "application/pdf"}
+            mock.content = b"%PDF-1.4 actual"
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert (tmp_path / "paper.pdf").exists()
+
 
 def test_download_pdf_no_candidates(tmp_path):
     pub = {"bib": {}, "eprint_url": "", "pub_url": "https://example.com/abstract"}

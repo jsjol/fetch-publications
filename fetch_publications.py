@@ -196,30 +196,53 @@ def _is_pdf_response(resp: requests.Response) -> bool:
     return resp.content[:4] == b"%PDF"
 
 
+_BIORXIV_RE = re.compile(r"(biorxiv|medrxiv)\.org/content/", re.IGNORECASE)
+
+
+def _to_pdf_url(url: str, pub: dict) -> list[str]:
+    """Return a list of concrete PDF URL(s) derived from *url*.
+
+    Handles known preprint server patterns:
+    * arXiv abstract → direct PDF URL
+    * bioRxiv / medRxiv abstract → ``.full.pdf`` URL (with original as fallback)
+    * All other URLs are returned unchanged (may be direct PDF links).
+    """
+    if not url:
+        return []
+    if re.search(r"arxiv\.org/abs/", url, re.IGNORECASE):
+        arxiv_id = extract_arxiv_id(pub)
+        return [f"https://arxiv.org/pdf/{arxiv_id}.pdf"]
+    if _BIORXIV_RE.search(url):
+        # PDF URL: strip trailing slash/version fragment, then append .full.pdf
+        pdf_url = url.rstrip("/") + ".full.pdf"
+        # Also keep the original as fallback in case the server redirects
+        return [pdf_url, url]
+    return [url]
+
+
 def _pdf_url_candidates(pub: dict) -> list[str]:
     """Return a list of URLs to try in order when looking for a PDF."""
+    seen: set[str] = set()
     candidates: list[str] = []
 
-    eprint = pub.get("eprint_url", "")
-    if eprint:
-        # arXiv: convert abstract URL to direct PDF URL
-        if re.search(r"arxiv\.org/abs/", eprint, re.IGNORECASE):
-            arxiv_id = extract_arxiv_id(pub)
-            candidates.append(f"https://arxiv.org/pdf/{arxiv_id}.pdf")
-        else:
-            candidates.append(eprint)
+    def add(url: str) -> None:
+        if url and url not in seen:
+            candidates.append(url)
+            seen.add(url)
 
-    # Use pub_url as a secondary candidate when it looks like a direct PDF
+    for url in _to_pdf_url(pub.get("eprint_url", ""), pub):
+        add(url)
+
+    # Use pub_url as a secondary candidate for known open-access patterns
     pub_url = pub.get("pub_url", "")
-    if pub_url and pub_url not in candidates:
-        if pub_url.lower().endswith(".pdf") or re.search(r"arxiv\.org/", pub_url, re.IGNORECASE):
-            if re.search(r"arxiv\.org/abs/", pub_url, re.IGNORECASE):
-                arxiv_id = extract_arxiv_id(pub)
-                url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-                if url not in candidates:
-                    candidates.append(url)
-            else:
-                candidates.append(pub_url)
+    if pub_url:
+        if (
+            re.search(r"arxiv\.org/", pub_url, re.IGNORECASE)
+            or _BIORXIV_RE.search(pub_url)
+            or pub_url.lower().endswith(".pdf")
+        ):
+            for url in _to_pdf_url(pub_url, pub):
+                add(url)
 
     return candidates
 
