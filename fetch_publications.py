@@ -218,6 +218,7 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
     * OpenReview forum page → PDF page
     * PMLR HTML paper page → PDF URL
     * DiVA portal record page → FULLTEXT01.pdf URL (with original as fallback)
+    * Google Patents page → returned as-is (PDF extracted by download_pdf scraping)
     * All other URLs are returned unchanged (may already be direct PDF links).
     """
     if not url:
