@@ -201,6 +201,12 @@ _BIORXIV_RE = re.compile(r"(biorxiv|medrxiv)\.org/content/", re.IGNORECASE)
 _OPENREVIEW_RE = re.compile(r"openreview\.net/forum\?", re.IGNORECASE)
 _PMLR_RE = re.compile(r"proceedings\.mlr\.press/.*\.html$", re.IGNORECASE)
 _DIVA_RE = re.compile(r"diva-portal\.org/smash/record\.jsf", re.IGNORECASE)
+_PATENTS_RE = re.compile(r"patents\.google\.com/patent/", re.IGNORECASE)
+# Matches the PDF download URL embedded in Google Patents HTML pages.
+_PATENT_PDF_EMBED_RE = re.compile(
+    r'https://patentimages\.storage\.googleapis\.com/[^"\'<>\s]+\.pdf',
+    re.IGNORECASE,
+)
 
 
 def _to_pdf_url(url: str, pub: dict) -> list[str]:
@@ -212,6 +218,7 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
     * OpenReview forum page → PDF page
     * PMLR HTML paper page → PDF URL
     * DiVA portal record page → FULLTEXT01.pdf URL (with original as fallback)
+    * Google Patents page → returned as-is (PDF extracted by download_pdf scraping)
     * All other URLs are returned unchanged (may already be direct PDF links).
     """
     if not url:
@@ -244,7 +251,16 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
             if base:
                 pdf_url = f"{base.group(1)}/smash/get/{diva_id}/FULLTEXT01.pdf"
                 return [pdf_url, url]
+    if _PATENTS_RE.search(url):
+        # Google Patents page: return as-is; download_pdf will scrape the PDF link.
+        return [url]
     return [url]
+
+
+def _extract_patent_pdf_url(html: str) -> str:
+    """Extract the PDF download URL embedded in a Google Patents HTML page."""
+    m = _PATENT_PDF_EMBED_RE.search(html)
+    return m.group(0) if m else ""
 
 
 def _pdf_url_candidates(pub: dict) -> list[str]:
@@ -276,6 +292,7 @@ def _pdf_url_candidates(pub: dict) -> list[str]:
             or _OPENREVIEW_RE.search(pub_url)
             or _PMLR_RE.search(pub_url)
             or _DIVA_RE.search(pub_url)
+            or _PATENTS_RE.search(pub_url)
             or pub_url.lower().endswith(".pdf")
         )
         if is_open_access or is_known_pattern:
@@ -303,6 +320,31 @@ def download_pdf(pub: dict, pub_dir: Path, force: bool = False) -> bool:
                 pdf_path.write_bytes(resp.content)
                 print(f"    PDF saved → {pdf_path}")
                 return True
+            # For Google Patents pages the response is HTML; extract the embedded
+            # PDF link (patentimages.storage.googleapis.com/…) and download it.
+            if (
+                resp.status_code == 200
+                and _PATENTS_RE.search(pdf_url)
+                and "html" in resp.headers.get("Content-Type", "").lower()
+            ):
+                extracted_pdf_url = _extract_patent_pdf_url(resp.text)
+                if extracted_pdf_url:
+                    try:
+                        pdf_resp = requests.get(
+                            extracted_pdf_url, headers=_HEADERS, timeout=60, allow_redirects=True
+                        )
+                        if pdf_resp.status_code == 200 and _is_pdf_response(pdf_resp):
+                            pdf_path = pub_dir / "paper.pdf"
+                            pdf_path.write_bytes(pdf_resp.content)
+                            print(f"    PDF saved → {pdf_path}")
+                            return True
+                        print(
+                            f"    Patent PDF not available at {extracted_pdf_url} "
+                            f"(status {pdf_resp.status_code}, "
+                            f"content-type: {pdf_resp.headers.get('Content-Type', '')})"
+                        )
+                    except requests.RequestException as exc:
+                        print(f"    Warning: Patent PDF download failed for {extracted_pdf_url}: {exc}")
             print(f"    PDF not available at {pdf_url} (status {resp.status_code}, "
                   f"content-type: {resp.headers.get('Content-Type', '')})")
         except requests.RequestException as exc:
