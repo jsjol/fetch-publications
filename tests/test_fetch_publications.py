@@ -1034,3 +1034,71 @@ def test_main_partial_bibtex_preserved_on_scholar_failure(tmp_path):
     assert "Good Paper" in bib_text
     # Bad Paper entry should still be present (created with partial data)
     assert "Bad Paper" in bib_text
+
+
+def test_main_all_pubs_in_bib_before_scholarly_fill(tmp_path):
+    """All publications must be written to the bib file before scholarly.fill()
+    is called for any individual publication.
+
+    This guarantees that the bib is complete (priority 1 from issue #8) even
+    if scholarly.fill() hangs or fails for some entries.
+    """
+    pubs = [_make_fake_pub(f"Paper {i}") for i in range(1, 6)]  # 5 publications
+    bib_path = tmp_path / "publications.bib"
+    event_log: list[str] = []
+
+    original_write_text = Path.write_text
+
+    def tracking_write_text(self, data, **kwargs):
+        if self == bib_path:
+            event_log.append(f"bib_write:{data.count('@article')}")
+        original_write_text(self, data, **kwargs)
+
+    fill_pub_calls = [0]
+
+    def fill_side_effect(obj, **kwargs):
+        if "sections" in kwargs:
+            return obj  # author fill – pass through
+        fill_pub_calls[0] += 1
+        event_log.append(f"fill_pub:{fill_pub_calls[0]}")
+        return obj
+
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {"name": "Test", "publications": pubs}
+    mock_scholarly.fill.side_effect = fill_side_effect
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch.object(Path, "write_text", tracking_write_text),
+        patch(
+            "sys.argv",
+            [
+                "fetch_publications.py",
+                "https://scholar.google.com/citations?user=TEST",
+                "--output-dir",
+                str(tmp_path),
+                "--no-pdf",
+                "--no-source",
+            ],
+        ),
+    ):
+        main()
+
+    # The bib file must contain all 5 entries BEFORE any fill() call for individual pubs
+    all_written_idx = next(
+        (i for i, e in enumerate(event_log) if e == "bib_write:5"), None
+    )
+    first_fill_idx = next(
+        (i for i, e in enumerate(event_log) if e.startswith("fill_pub")), None
+    )
+
+    assert all_written_idx is not None, "bib file was never written with all 5 entries"
+    if first_fill_idx is not None:
+        assert all_written_idx < first_fill_idx, (
+            "Expected all 5 publications to be written to bib before scholarly.fill() "
+            "is called for any individual publication. "
+            f"First 'all-written' bib event was at index {all_written_idx}, "
+            f"but first fill() call was at index {first_fill_idx}. "
+            "Event log: " + str(event_log)
+        )

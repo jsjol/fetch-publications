@@ -471,74 +471,98 @@ def main() -> None:
     print(f"Author: {name}")
     print(f"Publications found: {len(publications)}")
 
-    bibtex_entries: list[str] = []
     used_keys: set[str] = set()
-    enriched_pubs: list[dict] = []
+    # Each record stores the pub dict, its cite-key, and its current BibTeX string
+    # together to avoid parallel lists that could go out of sync.
+    records: list[dict] = []  # keys: "pub", "key", "bibtex"
 
     bib_path = output_dir / "publications.bib"
 
+    def _bib_text() -> str:
+        return "\n\n".join(r["bibtex"] for r in records) + "\n"
+
     # ------------------------------------------------------------------
-    # Phase 1: Fetch all publication metadata and build BibTeX.
-    # The BibTeX file is written after every entry so that partial
-    # results are preserved even if the process is interrupted later.
+    # Phase 1: Write ALL publications with basic info to the BibTeX file.
+    # This guarantees a complete bib (all references present) even if the
+    # subsequent enrichment phase hangs or fails for some entries.
     # ------------------------------------------------------------------
-    print("\n--- Phase 1: Fetching publication metadata and building BibTeX ---")
+    print("\n--- Phase 1: Building initial BibTeX from basic publication data ---")
     for idx, pub in enumerate(publications, start=1):
         raw_title = pub.get("bib", {}).get("title", "Unknown")
-        print(f"\n[{idx}/{len(publications)}] {raw_title[:80]}")
+        print(f"  [{idx}/{len(publications)}] {raw_title[:80]}")
 
-        # Fetch full details (abstract, URLs, …)
+        key = make_bibtex_key(pub, used_keys)
+        records.append({"pub": pub, "key": key, "bibtex": format_bibtex(pub, key)})
+
+        # Write after each entry so partial results survive an interruption
+        bib_path.write_text(_bib_text(), encoding="utf-8")
+
+    print(f"\nPhase 1 complete.  BibTeX file: {bib_path}  ({len(records)} entries)")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Enrich each publication with full details (abstract, URLs,
+    # venue fields, …).  The BibTeX entry is updated in-place and the file
+    # is rewritten after each successful enrichment so that progress is
+    # preserved even if this phase is interrupted.
+    # ------------------------------------------------------------------
+    print("\n--- Phase 2: Enriching publications with full details (abstract, URLs, …) ---")
+    for idx, record in enumerate(records, start=1):
+        raw_title = record["pub"].get("bib", {}).get("title", "Unknown")
+        print(f"\n[{idx}/{len(records)}] {raw_title[:80]}")
+
         print("  Fetching full details (may be slow if Scholar is rate-limiting)...",
               end="", flush=True)
         try:
-            pub = scholarly.fill(pub)
+            pub = scholarly.fill(record["pub"])
             print(" done.")
             time.sleep(args.delay)
         except Exception as exc:
             print(f" failed.")
             print(f"  Warning: could not fetch full details: {exc}")
+            pub = record["pub"]
 
-        key = make_bibtex_key(pub, used_keys)
-        bibtex_entries.append(format_bibtex(pub, key))
-        enriched_pubs.append(pub)
+        record["pub"] = pub
+        record["bibtex"] = format_bibtex(pub, record["key"])
 
-        # Write BibTeX after each entry so partial results are not lost
-        bib_path.write_text("\n\n".join(bibtex_entries) + "\n", encoding="utf-8")
+        # Rewrite the whole file so partial enrichment is not lost
+        bib_path.write_text(_bib_text(), encoding="utf-8")
 
-    print(f"\nPhase 1 complete.  BibTeX file: {bib_path}  ({len(bibtex_entries)} entries)")
+    print(f"\nPhase 2 complete.  BibTeX file: {bib_path}  ({len(records)} entries)")
 
     # ------------------------------------------------------------------
-    # Phase 2: Download PDFs.
+    # Phase 3: Download PDFs.
     # ------------------------------------------------------------------
     if not args.no_pdf:
-        print("\n--- Phase 2: Downloading PDFs ---")
-        for idx, pub in enumerate(enriched_pubs, start=1):
+        print("\n--- Phase 3: Downloading PDFs ---")
+        for idx, record in enumerate(records, start=1):
+            pub = record["pub"]
             raw_title = pub.get("bib", {}).get("title", "Unknown")
             candidates = _pdf_url_candidates(pub)
             if not candidates:
                 continue
-            print(f"\n[{idx}/{len(enriched_pubs)}] {raw_title[:80]}")
+            print(f"\n[{idx}/{len(records)}] {raw_title[:80]}")
             pub_dir = output_dir / make_folder_name(pub)
             pub_dir.mkdir(parents=True, exist_ok=True)
             download_pdf(pub, pub_dir, force=args.force)
 
     # ------------------------------------------------------------------
-    # Phase 3: Download LaTeX sources from arXiv.
+    # Phase 4: Download LaTeX sources from arXiv.
     # ------------------------------------------------------------------
     if not args.no_source:
-        print("\n--- Phase 3: Downloading LaTeX sources ---")
-        for idx, pub in enumerate(enriched_pubs, start=1):
+        print("\n--- Phase 4: Downloading LaTeX sources ---")
+        for idx, record in enumerate(records, start=1):
+            pub = record["pub"]
             arxiv_id = extract_arxiv_id(pub)
             if not arxiv_id:
                 continue
             raw_title = pub.get("bib", {}).get("title", "Unknown")
-            print(f"\n[{idx}/{len(enriched_pubs)}] {raw_title[:80]}")
+            print(f"\n[{idx}/{len(records)}] {raw_title[:80]}")
             pub_dir = output_dir / make_folder_name(pub)
             pub_dir.mkdir(parents=True, exist_ok=True)
             download_arxiv_source(arxiv_id, pub_dir, force=args.force)
             time.sleep(args.delay)
 
-    print(f"\nDone.  BibTeX file: {bib_path}  ({len(bibtex_entries)} entries)")
+    print(f"\nDone.  BibTeX file: {bib_path}  ({len(records)} entries)")
 
 
 if __name__ == "__main__":
