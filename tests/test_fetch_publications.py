@@ -1103,7 +1103,7 @@ def test_browser_flag_calls_scholarly_use_proxy(tmp_path):
 
     with (
         patch("fetch_publications.scholarly", mock_scholarly),
-        patch("fetch_publications.ProxyGenerator", mock_pg_class),
+        patch("fetch_publications._make_browser_proxy_generator", return_value=mock_pg),
         patch("fetch_publications.time.sleep"),
         patch("sys.argv", [
             "fetch_publications.py",
@@ -1118,6 +1118,72 @@ def test_browser_flag_calls_scholarly_use_proxy(tmp_path):
     mock_scholarly.use_proxy.assert_called_once(), (
         "scholarly.use_proxy must be called once to configure the browser-based "
         "CAPTCHA handler when --browser is set"
+    )
+
+
+def test_browser_flag_uses_single_proxy_generator(tmp_path):
+    """Both arguments to scholarly.use_proxy must be the SAME ProxyGenerator
+    instance so that one solved CAPTCHA covers all Scholar requests (pm1 and pm2
+    share the same httpx session and cookies).
+    """
+    pubs = [_make_fake_pub("Paper 1")]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    mock_pg = MagicMock()
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications._make_browser_proxy_generator", return_value=mock_pg),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+            "--browser",
+        ]),
+    ):
+        main()
+
+    args, _ = mock_scholarly.use_proxy.call_args
+    assert len(args) == 2, "use_proxy must be called with two positional arguments"
+    assert args[0] is args[1], (
+        "Both arguments to scholarly.use_proxy must be the SAME ProxyGenerator "
+        "instance so that one solved CAPTCHA covers pm1 and pm2. "
+        f"Got args[0]={args[0]!r}, args[1]={args[1]!r}"
+    )
+
+
+def test_scholarly_logging_enabled_always(tmp_path, capsys):
+    """The scholarly logger must have at least one handler attached so that
+    internal messages (CAPTCHA requests, retry waits, …) reach the user
+    regardless of whether --browser is set.
+    """
+    import logging
+
+    pubs = [_make_fake_pub("Paper 1")]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+        ]),
+    ):
+        main()
+
+    scholarly_logger = logging.getLogger("scholarly")
+    assert scholarly_logger.handlers, (
+        "The 'scholarly' logger must have at least one handler so its INFO-level "
+        "messages (CAPTCHA requests, retry waits, …) are visible to the user."
+    )
+    assert scholarly_logger.level <= logging.INFO, (
+        f"The 'scholarly' logger level must be INFO or lower. "
+        f"Got {logging.getLevelName(scholarly_logger.level)}"
     )
 
 

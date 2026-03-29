@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -514,27 +515,45 @@ def main() -> None:
     # already waits for the CAPTCHA to disappear; we only need to remove
     # the --headless flag so the user can actually see and interact with
     # the browser window.
+    #
+    # We use ONE ProxyGenerator for both scholarly's primary (pm1) and
+    # secondary (pm2) slots.  The navigator routes "citations?" URLs to
+    # pm2 and everything else to pm1; with separate generators each slot
+    # would require its own CAPTCHA solve.  Sharing a single generator
+    # means they share the same httpx.Client and cookies, so one CAPTCHA
+    # solve covers all subsequent requests.
+    #
+    # We also attach a StreamHandler to scholarly's INFO logger so the
+    # user can see messages like "Got a captcha request." or
+    # "Will retry after N seconds" instead of silent hangs.
     # ------------------------------------------------------------------
+    _scholarly_logger = logging.getLogger("scholarly")
+    if not _scholarly_logger.handlers:
+        _handler = logging.StreamHandler()
+        _handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        _scholarly_logger.addHandler(_handler)
+    _scholarly_logger.setLevel(logging.INFO)
+
     if args.browser:
         print(
             "Browser mode enabled.  A browser window will open automatically if "
-            "Google Scholar presents a CAPTCHA — solve it there and the script "
-            "will continue."
+            "Google Scholar presents a CAPTCHA — solve it once there and the "
+            "script will continue."
         )
-        primary_pg = _make_browser_proxy_generator()
-        secondary_pg = _make_browser_proxy_generator()
-        scholarly.use_proxy(primary_pg, secondary_pg)
+        pg = _make_browser_proxy_generator()
+        scholarly.use_proxy(pg, pg)
 
     # Fetch author profile
     try:
         author = scholarly.search_author_id(author_id)
         author = scholarly.fill(author, sections=["basics", "indices", "publications"])
     except Exception as exc:
-        print(f"Error fetching author profile: {exc}")
+        print(f"Error fetching author profile: {type(exc).__name__}: {exc}")
         if not args.browser:
             print(
-                "Tip: if Google Scholar is blocking the request, re-run with --browser "
-                "to open a browser window where you can solve a CAPTCHA manually."
+                "Tip: if Google Scholar is blocking the request, re-run the same "
+                "command with --browser added to open a browser window where you "
+                "can solve a CAPTCHA manually."
             )
         sys.exit(1)
 
