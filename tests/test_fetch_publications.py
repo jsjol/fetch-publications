@@ -1426,3 +1426,97 @@ def test_main_all_pubs_in_bib_before_scholarly_fill(tmp_path):
             f"but first fill() call was at index {first_fill_idx}. "
             "Event log: " + str(event_log)
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3/4 robustness: loop must not stop on unexpected exceptions
+# ---------------------------------------------------------------------------
+
+def test_phase3_continues_after_pdf_download_exception(tmp_path):
+    """Phase 3 must continue processing remaining publications even when
+    download_pdf raises an unexpected exception (e.g. OSError) for one entry.
+
+    Without a try/except in the Phase 3 loop, the first uncaught exception
+    stops the loop and all older publications (processed later in reverse-
+    chronological order) are silently skipped.
+    """
+    pubs = [
+        _make_fake_pub("New Paper", year="2023", arxiv_id="2301.00001"),
+        _make_fake_pub("Middle Paper", year="2021", arxiv_id="2101.00001"),
+        _make_fake_pub("Old Paper", year="2019", arxiv_id="1901.00001"),
+    ]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    attempted_titles: list[str] = []
+
+    def fake_download_pdf(pub, pub_dir, force=False):
+        title = pub.get("bib", {}).get("title", "")
+        attempted_titles.append(title)
+        if title == "Middle Paper":
+            raise OSError("Simulated disk-full error")
+        return True
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("fetch_publications.download_pdf", side_effect=fake_download_pdf),
+        patch("fetch_publications.download_arxiv_source", return_value=False),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-source",
+        ]),
+    ):
+        main()
+
+    assert "New Paper" in attempted_titles, "New Paper should have been attempted"
+    assert "Middle Paper" in attempted_titles, "Middle Paper should have been attempted"
+    assert "Old Paper" in attempted_titles, (
+        "Old Paper must still be attempted even though Middle Paper raised an "
+        "exception.  The Phase 3 loop must not abort on unexpected errors."
+    )
+
+
+def test_phase4_continues_after_source_download_exception(tmp_path):
+    """Phase 4 must continue processing remaining publications even when
+    download_arxiv_source raises an unexpected exception for one entry.
+
+    Without a try/except in the Phase 4 loop, the first uncaught exception
+    stops the loop and older publications lose their LaTeX source downloads.
+    """
+    pubs = [
+        _make_fake_pub("New Paper", year="2023", arxiv_id="2301.00001"),
+        _make_fake_pub("Middle Paper", year="2021", arxiv_id="2101.00001"),
+        _make_fake_pub("Old Paper", year="2019", arxiv_id="1901.00001"),
+    ]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    attempted_ids: list[str] = []
+
+    def fake_download_source(arxiv_id, pub_dir, force=False):
+        attempted_ids.append(arxiv_id)
+        if arxiv_id == "2101.00001":
+            raise OSError("Simulated disk-full error")
+        return True
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("fetch_publications.download_pdf", return_value=False),
+        patch("fetch_publications.download_arxiv_source", side_effect=fake_download_source),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf",
+        ]),
+    ):
+        main()
+
+    assert "2301.00001" in attempted_ids, "New Paper's arXiv source should have been attempted"
+    assert "2101.00001" in attempted_ids, "Middle Paper's arXiv source should have been attempted"
+    assert "1901.00001" in attempted_ids, (
+        "Old Paper's arXiv source must still be attempted even though Middle Paper "
+        "raised an exception.  The Phase 4 loop must not abort on unexpected errors."
+    )

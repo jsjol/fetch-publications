@@ -729,7 +729,10 @@ def main() -> None:
             print(f"\n[{idx}/{len(records)}] {raw_title[:80]}")
             pub_dir = output_dir / make_folder_name(pub)
             pub_dir.mkdir(parents=True, exist_ok=True)
-            download_pdf(pub, pub_dir, force=args.force)
+            try:
+                download_pdf(pub, pub_dir, force=args.force)
+            except Exception as exc:
+                print(f"    Warning: unexpected error during PDF download: {exc}")
 
     # ------------------------------------------------------------------
     # Phase 4: Download LaTeX sources from arXiv.
@@ -745,7 +748,10 @@ def main() -> None:
             print(f"\n[{idx}/{len(records)}] {raw_title[:80]}")
             pub_dir = output_dir / make_folder_name(pub)
             pub_dir.mkdir(parents=True, exist_ok=True)
-            download_arxiv_source(arxiv_id, pub_dir, force=args.force)
+            try:
+                download_arxiv_source(arxiv_id, pub_dir, force=args.force)
+            except Exception as exc:
+                print(f"    Warning: unexpected error during arXiv source download: {exc}")
             time.sleep(args.delay)
 
     print(f"\nDone.  BibTeX file: {bib_path}  ({len(records)} entries)")
