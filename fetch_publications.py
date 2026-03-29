@@ -19,11 +19,12 @@ import re
 import sys
 import tarfile
 import time
+import types
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
-from scholarly import scholarly
+from scholarly import ProxyGenerator, scholarly
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +411,45 @@ def download_arxiv_source(arxiv_id: str, pub_dir: Path, force: bool = False) -> 
 
 
 # ---------------------------------------------------------------------------
+# Browser-based CAPTCHA fallback
+# ---------------------------------------------------------------------------
+
+def _make_browser_proxy_generator() -> ProxyGenerator:
+    """Return a ProxyGenerator configured to open a *visible* browser window.
+
+    ``scholarly``'s built-in CAPTCHA handler (``_handle_captcha2``) opens a
+    Selenium browser and waits until the CAPTCHA disappears.  By default it
+    uses ``--headless``, so the user never sees the page and the script hangs
+    forever.  This function monkey-patches both ``_get_chrome_webdriver`` and
+    ``_get_firefox_webdriver`` to remove the headless flag, so that when
+    Google Scholar presents a CAPTCHA the browser window is visible and the
+    user can solve it manually.
+    """
+    pg = ProxyGenerator()
+
+    def _get_chrome_webdriver(self: ProxyGenerator):
+        from selenium import webdriver as _webdriver
+        options = _webdriver.ChromeOptions()
+        # Intentionally no --headless: the user must be able to see and solve the CAPTCHA.
+        self._webdriver = _webdriver.Chrome(options=options)
+        self._webdriver.get("https://scholar.google.com")
+        return self._webdriver
+
+    def _get_firefox_webdriver(self: ProxyGenerator):
+        from selenium import webdriver as _webdriver
+        from selenium.webdriver.firefox.options import Options as _FirefoxOptions
+        options = _FirefoxOptions()
+        # Intentionally no --headless: the user must be able to see and solve the CAPTCHA.
+        self._webdriver = _webdriver.Firefox(options=options)
+        self._webdriver.get("https://scholar.google.com")
+        return self._webdriver
+
+    pg._get_chrome_webdriver = types.MethodType(_get_chrome_webdriver, pg)
+    pg._get_firefox_webdriver = types.MethodType(_get_firefox_webdriver, pg)
+    return pg
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -442,6 +482,16 @@ def main() -> None:
         default=2.0,
         help="Seconds to wait between Scholar requests to avoid rate-limiting (default: 2)",
     )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help=(
+            "Open a visible browser window so you can solve a Google Scholar CAPTCHA "
+            "manually.  Use this when the tool is blocked by rate-limiting or CAPTCHA "
+            "challenges.  Requires Chrome or Firefox with the matching WebDriver "
+            "(chromedriver / geckodriver) on your PATH."
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -458,12 +508,34 @@ def main() -> None:
     author_id = m.group(1)
     print(f"Author ID: {author_id}")
 
+    # ------------------------------------------------------------------
+    # Optional: configure scholarly with a visible browser so CAPTCHAs
+    # can be solved manually.  scholarly's built-in _handle_captcha2()
+    # already waits for the CAPTCHA to disappear; we only need to remove
+    # the --headless flag so the user can actually see and interact with
+    # the browser window.
+    # ------------------------------------------------------------------
+    if args.browser:
+        print(
+            "Browser mode enabled.  A browser window will open automatically if "
+            "Google Scholar presents a CAPTCHA — solve it there and the script "
+            "will continue."
+        )
+        primary_pg = _make_browser_proxy_generator()
+        secondary_pg = _make_browser_proxy_generator()
+        scholarly.use_proxy(primary_pg, secondary_pg)
+
     # Fetch author profile
     try:
         author = scholarly.search_author_id(author_id)
         author = scholarly.fill(author, sections=["basics", "indices", "publications"])
     except Exception as exc:
         print(f"Error fetching author profile: {exc}")
+        if not args.browser:
+            print(
+                "Tip: if Google Scholar is blocking the request, re-run with --browser "
+                "to open a browser window where you can solve a CAPTCHA manually."
+            )
         sys.exit(1)
 
     name = author.get("name", "Unknown")

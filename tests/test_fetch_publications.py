@@ -22,6 +22,7 @@ from fetch_publications import (
     _pdf_url_candidates,
     _to_pdf_url,
     _extract_patent_pdf_url,
+    _make_browser_proxy_generator,
     main,
 )
 
@@ -1034,6 +1035,117 @@ def test_main_partial_bibtex_preserved_on_scholar_failure(tmp_path):
     assert "Good Paper" in bib_text
     # Bad Paper entry should still be present (created with partial data)
     assert "Bad Paper" in bib_text
+
+
+# ---------------------------------------------------------------------------
+# _make_browser_proxy_generator / --browser flag tests
+# ---------------------------------------------------------------------------
+
+def test_make_browser_proxy_generator_chrome_not_headless():
+    """The Chrome webdriver opened by _make_browser_proxy_generator must NOT use
+    --headless so the user can see (and solve) the CAPTCHA.
+    """
+    pg = _make_browser_proxy_generator()
+
+    chrome_options_seen: list = []
+    mock_driver = MagicMock()
+    mock_driver.get = MagicMock()
+
+    def fake_chrome(options=None, **kwargs):
+        chrome_options_seen.append(options)
+        return mock_driver
+
+    with patch("selenium.webdriver.Chrome", side_effect=fake_chrome):
+        pg._get_chrome_webdriver()
+
+    assert chrome_options_seen, "Chrome was never instantiated"
+    args = chrome_options_seen[0].arguments if chrome_options_seen[0] else []
+    assert "--headless" not in args, (
+        f"Chrome must NOT be headless so the user can solve the CAPTCHA. "
+        f"Got options.arguments={args}"
+    )
+
+
+def test_make_browser_proxy_generator_firefox_not_headless():
+    """The Firefox webdriver opened by _make_browser_proxy_generator must NOT use
+    --headless so the user can see (and solve) the CAPTCHA.
+    """
+    pg = _make_browser_proxy_generator()
+
+    firefox_options_seen: list = []
+    mock_driver = MagicMock()
+    mock_driver.get = MagicMock()
+
+    def fake_firefox(options=None, **kwargs):
+        firefox_options_seen.append(options)
+        return mock_driver
+
+    with patch("selenium.webdriver.Firefox", side_effect=fake_firefox):
+        pg._get_firefox_webdriver()
+
+    assert firefox_options_seen, "Firefox was never instantiated"
+    args = firefox_options_seen[0].arguments if firefox_options_seen[0] else []
+    assert "--headless" not in args, (
+        f"Firefox must NOT be headless so the user can solve the CAPTCHA. "
+        f"Got options.arguments={args}"
+    )
+
+
+def test_browser_flag_calls_scholarly_use_proxy(tmp_path):
+    """When --browser is passed, scholarly.use_proxy must be called so that
+    scholarly is configured with a visible-browser CAPTCHA handler.
+    """
+    pubs = [_make_fake_pub("Paper 1")]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    mock_pg = MagicMock()
+    mock_pg_class = MagicMock(return_value=mock_pg)
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.ProxyGenerator", mock_pg_class),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+            "--browser",
+        ]),
+    ):
+        main()
+
+    mock_scholarly.use_proxy.assert_called_once(), (
+        "scholarly.use_proxy must be called once to configure the browser-based "
+        "CAPTCHA handler when --browser is set"
+    )
+
+
+def test_error_without_browser_flag_suggests_browser(tmp_path, capsys):
+    """When the author-profile fetch fails and --browser was not set, the error
+    output must suggest running again with --browser so the user knows about the
+    CAPTCHA-solving fallback.
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.side_effect = RuntimeError("MaxTriesExceeded")
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+        ]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    captured = capsys.readouterr()
+    assert "--browser" in captured.out, (
+        "The error message should suggest --browser as a fallback when the initial "
+        f"fetch fails. Got stdout={captured.out!r}"
+    )
 
 
 def test_main_author_search_error_visible_on_stdout(tmp_path, capsys):
