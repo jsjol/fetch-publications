@@ -463,13 +463,18 @@ def main() -> None:
         author = scholarly.search_author_id(author_id)
         author = scholarly.fill(author, sections=["basics", "indices", "publications"])
     except Exception as exc:
-        print(f"Error fetching author profile: {exc}", file=sys.stderr)
+        print(f"Error fetching author profile: {exc}")
         sys.exit(1)
 
     name = author.get("name", "Unknown")
     publications = author.get("publications", [])
     print(f"Author: {name}")
     print(f"Publications found: {len(publications)}")
+    if not publications:
+        print(
+            "Warning: no publications found. This may indicate that Google Scholar "
+            "blocked the request. Try again later or increase --delay."
+        )
 
     used_keys: set[str] = set()
     # Each record stores the pub dict, its cite-key, and its current BibTeX string

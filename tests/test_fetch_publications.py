@@ -1036,6 +1036,82 @@ def test_main_partial_bibtex_preserved_on_scholar_failure(tmp_path):
     assert "Bad Paper" in bib_text
 
 
+def test_main_author_search_error_visible_on_stdout(tmp_path, capsys):
+    """When scholarly.search_author_id() raises, the error must appear on stdout.
+
+    Previously the error was only sent to stderr, causing it to be invisible
+    when the user does not capture stderr — the script appeared to hang after
+    printing 'Author ID: …' with no further output.
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.side_effect = RuntimeError("Scholar rate limit hit")
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "Scholar rate limit hit" in captured.out, (
+        "Error message must be on stdout so the user can see it. "
+        f"Got stdout={captured.out!r}, stderr={captured.err!r}"
+    )
+
+
+def test_main_author_fill_error_visible_on_stdout(tmp_path, capsys):
+    """When scholarly.fill() raises during the author-profile fetch, the error
+    must appear on stdout (not only on stderr).
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {"name": "Test Author", "publications": []}
+    mock_scholarly.fill.side_effect = RuntimeError("MaxTriesExceeded: Google Scholar blocked")
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "MaxTriesExceeded" in captured.out, (
+        "Error message must be on stdout so the user can see it. "
+        f"Got stdout={captured.out!r}, stderr={captured.err!r}"
+    )
+
+
+def test_main_empty_publications_warns_user(tmp_path, capsys):
+    """When scholarly returns zero publications (e.g. because the profile is
+    blocked), the script should print a clear warning instead of silently
+    producing an empty bib file.
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {"name": "Test Author", "publications": []}
+    mock_scholarly.fill.side_effect = lambda obj, **kwargs: obj
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+    ):
+        main()
+
+    captured = capsys.readouterr()
+    assert "Publications found: 0" in captured.out, (
+        "Should print 'Publications found: 0' so user notices the issue. "
+        f"Got stdout={captured.out!r}"
+    )
+    # A warning about zero publications should also appear
+    assert "Warning: no publications found" in captured.out, (
+        "Expected a 'Warning: no publications found' message. "
+        f"Got stdout={captured.out!r}"
+    )
+
+
 def test_main_all_pubs_in_bib_before_scholarly_fill(tmp_path):
     """All publications must be written to the bib file before scholarly.fill()
     is called for any individual publication.
