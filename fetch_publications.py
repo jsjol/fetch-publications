@@ -14,16 +14,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import sys
 import tarfile
 import time
+import types
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
-from scholarly import scholarly
+from scholarly import ProxyGenerator, scholarly
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +412,135 @@ def download_arxiv_source(arxiv_id: str, pub_dir: Path, force: bool = False) -> 
 
 
 # ---------------------------------------------------------------------------
+# Browser-based CAPTCHA fallback
+# ---------------------------------------------------------------------------
+
+def _make_browser_proxy_generator() -> ProxyGenerator:
+    """Return a ProxyGenerator configured to open a *visible* browser window.
+
+    ``scholarly``'s built-in CAPTCHA handler (``_handle_captcha2``) opens a
+    Selenium browser and waits until the CAPTCHA disappears.  By default it
+    uses ``--headless``, so the user never sees the page and the script hangs
+    forever.  This function monkey-patches ``_get_chrome_webdriver``,
+    ``_get_firefox_webdriver``, and ``_handle_captcha2`` so that:
+
+    1. The browser window is *visible* so the user can solve the CAPTCHA.
+    2. After solving, cookies are copied back into the ``httpx.Client`` session
+       correctly.  scholarly 1.7.x uses ``httpx.Client`` whose ``Cookies.set()``
+       only accepts ``(name, value, domain, path)`` — passing extra Selenium
+       cookie fields (e.g. ``secure``) causes a ``TypeError`` that makes
+       scholarly discard the session and immediately ask for another CAPTCHA.
+    """
+    pg = ProxyGenerator()
+
+    def _get_chrome_webdriver(self: ProxyGenerator):
+        from selenium import webdriver as _webdriver
+        options = _webdriver.ChromeOptions()
+        # Intentionally no --headless: the user must be able to see and solve the CAPTCHA.
+        self._webdriver = _webdriver.Chrome(options=options)
+        self._webdriver.get("https://scholar.google.com")
+        return self._webdriver
+
+    def _get_firefox_webdriver(self: ProxyGenerator):
+        from selenium import webdriver as _webdriver
+        from selenium.webdriver.firefox.options import Options as _FirefoxOptions
+        options = _FirefoxOptions()
+        # Intentionally no --headless: the user must be able to see and solve the CAPTCHA.
+        self._webdriver = _webdriver.Firefox(options=options)
+        self._webdriver.get("https://scholar.google.com")
+        return self._webdriver
+
+    def _handle_captcha2(self: ProxyGenerator, url: str):
+        """Fixed version of scholarly's _handle_captcha2.
+
+        Identical to the upstream implementation except that the cookie-copying
+        loop at the end calls ``httpx.Cookies.set(name, value, domain, path)``
+        explicitly instead of unpacking the full Selenium cookie dict with
+        ``**cookie``.  The upstream code leaves ``secure`` (and potentially
+        other browser-specific keys) in the dict, which causes
+        ``TypeError: Cookies.set() got an unexpected keyword argument 'secure'``
+        on httpx ≥ 0.23.  That exception makes scholarly discard the session
+        and open a fresh one — triggering yet another CAPTCHA immediately.
+        """
+        from urllib.parse import urlparse as _urlparse
+        from selenium.webdriver.support.ui import WebDriverWait as _WebDriverWait
+        from selenium.common.exceptions import (
+            TimeoutException as _TimeoutException,
+            UnexpectedAlertPresentException as _UnexpectedAlertPresentException,
+            WebDriverException as _WebDriverException,
+        )
+        from scholarly._proxy_generator import DOSException as _DOSException
+        import time as _time
+
+        cur_host = _urlparse(self._get_webdriver().current_url).hostname
+        for cookie in self._session.cookies:
+            if cur_host == cookie.domain.lstrip("."):
+                self._get_webdriver().add_cookie({
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "path": cookie.path,
+                    "domain": cookie.domain,
+                })
+        self._get_webdriver().get(url)
+
+        log_interval = 10
+        cur = 0
+        timeout = 60 * 60 * 24 * 7  # 1 week
+        while cur < timeout:
+            try:
+                cur = cur + log_interval
+                _WebDriverWait(self._get_webdriver(), log_interval).until_not(
+                    lambda drv: self._webdriver_has_captcha()
+                )
+                break
+            except _TimeoutException:
+                self.logger.info(
+                    f"Solving the captcha took already {cur} seconds "
+                    f"(of maximum {timeout} s)."
+                )
+            except _UnexpectedAlertPresentException as e:
+                self.logger.info(
+                    f"Unexpected alert while waiting for captcha completion: {e.args}"
+                )
+                _time.sleep(15)
+            except _DOSException as e:
+                self.logger.info("Google thinks we are DOSing the captcha.")
+                raise e
+            except _WebDriverException as e:
+                self.logger.info("Browser seems to be dysfunctional - closed by user?")
+                raise e
+            except Exception as e:
+                self.logger.info(
+                    f"Unhandled {type(e).__name__} while waiting for captcha "
+                    f"completion: {e.args}"
+                )
+        else:
+            raise _TimeoutException(
+                f"Could not solve captcha in time (within {timeout} s)."
+            )
+        self.logger.info(f"Solved captcha in less than {cur} seconds.")
+
+        # Copy browser cookies back into the httpx.Client session.
+        # httpx.Cookies.set() only accepts (name, value, domain, path).
+        # Passing the full Selenium cookie dict with **cookie crashes on 'secure'
+        # and any other browser-specific keys not recognised by httpx.
+        for cookie in self._get_webdriver().get_cookies():
+            self._session.cookies.set(
+                name=cookie["name"],
+                value=cookie["value"],
+                domain=cookie.get("domain", ""),
+                path=cookie.get("path", "/"),
+            )
+
+        return self._session
+
+    pg._get_chrome_webdriver = types.MethodType(_get_chrome_webdriver, pg)
+    pg._get_firefox_webdriver = types.MethodType(_get_firefox_webdriver, pg)
+    pg._handle_captcha2 = types.MethodType(_handle_captcha2, pg)
+    return pg
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -442,6 +573,16 @@ def main() -> None:
         default=2.0,
         help="Seconds to wait between Scholar requests to avoid rate-limiting (default: 2)",
     )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help=(
+            "Open a visible browser window so you can solve a Google Scholar CAPTCHA "
+            "manually.  Use this when the tool is blocked by rate-limiting or CAPTCHA "
+            "challenges.  Requires Chrome or Firefox with the matching WebDriver "
+            "(chromedriver / geckodriver) on your PATH."
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -458,18 +599,63 @@ def main() -> None:
     author_id = m.group(1)
     print(f"Author ID: {author_id}")
 
+    # ------------------------------------------------------------------
+    # Optional: configure scholarly with a visible browser so CAPTCHAs
+    # can be solved manually.  scholarly's built-in _handle_captcha2()
+    # already waits for the CAPTCHA to disappear; we only need to remove
+    # the --headless flag so the user can actually see and interact with
+    # the browser window.
+    #
+    # We use ONE ProxyGenerator for both scholarly's primary (pm1) and
+    # secondary (pm2) slots.  The navigator routes "citations?" URLs to
+    # pm2 and everything else to pm1; with separate generators each slot
+    # would require its own CAPTCHA solve.  Sharing a single generator
+    # means they share the same httpx.Client and cookies, so one CAPTCHA
+    # solve covers all subsequent requests.
+    #
+    # We also attach a StreamHandler to scholarly's INFO logger so the
+    # user can see messages like "Got a captcha request." or
+    # "Will retry after N seconds" instead of silent hangs.
+    # ------------------------------------------------------------------
+    _scholarly_logger = logging.getLogger("scholarly")
+    if not _scholarly_logger.handlers:
+        _handler = logging.StreamHandler()
+        _handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        _scholarly_logger.addHandler(_handler)
+    _scholarly_logger.setLevel(logging.INFO)
+
+    if args.browser:
+        print(
+            "Browser mode enabled.  A browser window will open automatically if "
+            "Google Scholar presents a CAPTCHA — solve it once there and the "
+            "script will continue."
+        )
+        pg = _make_browser_proxy_generator()
+        scholarly.use_proxy(pg, pg)
+
     # Fetch author profile
     try:
         author = scholarly.search_author_id(author_id)
         author = scholarly.fill(author, sections=["basics", "indices", "publications"])
     except Exception as exc:
-        print(f"Error fetching author profile: {exc}", file=sys.stderr)
+        print(f"Error fetching author profile: {type(exc).__name__}: {exc}")
+        if not args.browser:
+            print(
+                "Tip: if Google Scholar is blocking the request, re-run the same "
+                "command with --browser added to open a browser window where you "
+                "can solve a CAPTCHA manually."
+            )
         sys.exit(1)
 
     name = author.get("name", "Unknown")
     publications = author.get("publications", [])
     print(f"Author: {name}")
     print(f"Publications found: {len(publications)}")
+    if not publications:
+        print(
+            "Warning: no publications found. This may indicate that Google Scholar "
+            "blocked the request. Try again later or increase --delay."
+        )
 
     used_keys: set[str] = set()
     # Each record stores the pub dict, its cite-key, and its current BibTeX string

@@ -22,6 +22,7 @@ from fetch_publications import (
     _pdf_url_candidates,
     _to_pdf_url,
     _extract_patent_pdf_url,
+    _make_browser_proxy_generator,
     main,
 )
 
@@ -1034,6 +1035,329 @@ def test_main_partial_bibtex_preserved_on_scholar_failure(tmp_path):
     assert "Good Paper" in bib_text
     # Bad Paper entry should still be present (created with partial data)
     assert "Bad Paper" in bib_text
+
+
+# ---------------------------------------------------------------------------
+# _make_browser_proxy_generator / --browser flag tests
+# ---------------------------------------------------------------------------
+
+def test_make_browser_proxy_generator_chrome_not_headless():
+    """The Chrome webdriver opened by _make_browser_proxy_generator must NOT use
+    --headless so the user can see (and solve) the CAPTCHA.
+    """
+    pg = _make_browser_proxy_generator()
+
+    chrome_options_seen: list = []
+    mock_driver = MagicMock()
+    mock_driver.get = MagicMock()
+
+    def fake_chrome(options=None, **kwargs):
+        chrome_options_seen.append(options)
+        return mock_driver
+
+    with patch("selenium.webdriver.Chrome", side_effect=fake_chrome):
+        pg._get_chrome_webdriver()
+
+    assert chrome_options_seen, "Chrome was never instantiated"
+    args = chrome_options_seen[0].arguments if chrome_options_seen[0] else []
+    assert "--headless" not in args, (
+        f"Chrome must NOT be headless so the user can solve the CAPTCHA. "
+        f"Got options.arguments={args}"
+    )
+
+
+def test_make_browser_proxy_generator_firefox_not_headless():
+    """The Firefox webdriver opened by _make_browser_proxy_generator must NOT use
+    --headless so the user can see (and solve) the CAPTCHA.
+    """
+    pg = _make_browser_proxy_generator()
+
+    firefox_options_seen: list = []
+    mock_driver = MagicMock()
+    mock_driver.get = MagicMock()
+
+    def fake_firefox(options=None, **kwargs):
+        firefox_options_seen.append(options)
+        return mock_driver
+
+    with patch("selenium.webdriver.Firefox", side_effect=fake_firefox):
+        pg._get_firefox_webdriver()
+
+    assert firefox_options_seen, "Firefox was never instantiated"
+    args = firefox_options_seen[0].arguments if firefox_options_seen[0] else []
+    assert "--headless" not in args, (
+        f"Firefox must NOT be headless so the user can solve the CAPTCHA. "
+        f"Got options.arguments={args}"
+    )
+
+
+def test_handle_captcha2_fixed_copies_cookies_without_secure_kwarg():
+    """After solving a CAPTCHA, the patched _handle_captcha2 must copy browser
+    cookies into the httpx session using only (name, value, domain, path).
+
+    scholarly 1.7.x uses httpx.Client internally.  httpx.Cookies.set() only
+    accepts those four parameters; passing 'secure' (or any other
+    browser-specific key) raises TypeError.  That crash causes scholarly to
+    discard the session and open a fresh one, immediately triggering another
+    CAPTCHA.  This test verifies that our override avoids that crash.
+    """
+    import types as _types
+    from unittest.mock import MagicMock, call
+
+    pg = _make_browser_proxy_generator()
+
+    # --- fake webdriver that looks solved from the start ---
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://scholar.google.com/scholar"
+    mock_driver.get_cookies.return_value = [
+        # A typical Selenium cookie dict: includes 'secure', 'httpOnly', etc.
+        {
+            "name": "GSP",
+            "value": "abc123",
+            "domain": ".google.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "None",
+            "expiry": 9999999999,
+        },
+        {
+            "name": "NID",
+            "value": "xyz",
+            "domain": ".google.com",
+            "path": "/",
+            "secure": False,
+            "httpOnly": True,
+        },
+    ]
+    pg._webdriver = mock_driver
+    pg._get_webdriver = lambda: mock_driver
+
+    # _webdriver_has_captcha() returns False → CAPTCHA is already solved
+    pg._webdriver_has_captcha = MagicMock(return_value=False)
+
+    # --- httpx session with a trackable Cookies.set() ---
+    mock_cookies = MagicMock()
+    mock_session = MagicMock()
+    mock_session.cookies = mock_cookies
+    mock_session.cookies.__iter__ = MagicMock(return_value=iter([]))  # no existing cookies
+    pg._session = mock_session
+
+    # Run: must NOT raise TypeError
+    pg._handle_captcha2("https://scholar.google.com/scholar?q=test")
+
+    # Cookies must be set using ONLY name/value/domain/path
+    expected_calls = [
+        call(name="GSP", value="abc123", domain=".google.com", path="/"),
+        call(name="NID", value="xyz", domain=".google.com", path="/"),
+    ]
+    mock_cookies.set.assert_has_calls(expected_calls, any_order=False)
+
+    # Confirm 'secure' was NEVER passed as a keyword argument
+    for actual_call in mock_cookies.set.call_args_list:
+        assert "secure" not in actual_call.kwargs, (
+            f"'secure' must not be passed to httpx.Cookies.set(). "
+            f"Got kwargs={actual_call.kwargs!r}"
+        )
+
+
+def test_browser_flag_calls_scholarly_use_proxy(tmp_path):
+    """When --browser is passed, scholarly.use_proxy must be called so that
+    scholarly is configured with a visible-browser CAPTCHA handler.
+    """
+    pubs = [_make_fake_pub("Paper 1")]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    mock_pg = MagicMock()
+    mock_pg_class = MagicMock(return_value=mock_pg)
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications._make_browser_proxy_generator", return_value=mock_pg),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+            "--browser",
+        ]),
+    ):
+        main()
+
+    mock_scholarly.use_proxy.assert_called_once(), (
+        "scholarly.use_proxy must be called once to configure the browser-based "
+        "CAPTCHA handler when --browser is set"
+    )
+
+
+def test_browser_flag_uses_single_proxy_generator(tmp_path):
+    """Both arguments to scholarly.use_proxy must be the SAME ProxyGenerator
+    instance so that one solved CAPTCHA covers all Scholar requests (pm1 and pm2
+    share the same httpx session and cookies).
+    """
+    pubs = [_make_fake_pub("Paper 1")]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    mock_pg = MagicMock()
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications._make_browser_proxy_generator", return_value=mock_pg),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+            "--browser",
+        ]),
+    ):
+        main()
+
+    args, _ = mock_scholarly.use_proxy.call_args
+    assert len(args) == 2, "use_proxy must be called with two positional arguments"
+    assert args[0] is args[1], (
+        "Both arguments to scholarly.use_proxy must be the SAME ProxyGenerator "
+        "instance so that one solved CAPTCHA covers pm1 and pm2. "
+        f"Got args[0]={args[0]!r}, args[1]={args[1]!r}"
+    )
+
+
+def test_scholarly_logging_enabled_always(tmp_path, capsys):
+    """The scholarly logger must have at least one handler attached so that
+    internal messages (CAPTCHA requests, retry waits, …) reach the user
+    regardless of whether --browser is set.
+    """
+    import logging
+
+    pubs = [_make_fake_pub("Paper 1")]
+    mock_scholarly = _make_mock_scholarly(pubs)
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+        ]),
+    ):
+        main()
+
+    scholarly_logger = logging.getLogger("scholarly")
+    assert scholarly_logger.handlers, (
+        "The 'scholarly' logger must have at least one handler so its INFO-level "
+        "messages (CAPTCHA requests, retry waits, …) are visible to the user."
+    )
+    assert scholarly_logger.level <= logging.INFO, (
+        f"The 'scholarly' logger level must be INFO or lower. "
+        f"Got {logging.getLevelName(scholarly_logger.level)}"
+    )
+
+
+def test_error_without_browser_flag_suggests_browser(tmp_path, capsys):
+    """When the author-profile fetch fails and --browser was not set, the error
+    output must suggest running again with --browser so the user knows about the
+    CAPTCHA-solving fallback.
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.side_effect = RuntimeError("MaxTriesExceeded")
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("sys.argv", [
+            "fetch_publications.py",
+            "https://scholar.google.com/citations?user=TEST",
+            "--output-dir", str(tmp_path),
+            "--no-pdf", "--no-source",
+        ]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    captured = capsys.readouterr()
+    assert "--browser" in captured.out, (
+        "The error message should suggest --browser as a fallback when the initial "
+        f"fetch fails. Got stdout={captured.out!r}"
+    )
+
+
+def test_main_author_search_error_visible_on_stdout(tmp_path, capsys):
+    """When scholarly.search_author_id() raises, the error must appear on stdout.
+
+    Previously the error was only sent to stderr, causing it to be invisible
+    when the user does not capture stderr — the script appeared to hang after
+    printing 'Author ID: …' with no further output.
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.side_effect = RuntimeError("Scholar rate limit hit")
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "Scholar rate limit hit" in captured.out, (
+        "Error message must be on stdout so the user can see it. "
+        f"Got stdout={captured.out!r}, stderr={captured.err!r}"
+    )
+
+
+def test_main_author_fill_error_visible_on_stdout(tmp_path, capsys):
+    """When scholarly.fill() raises during the author-profile fetch, the error
+    must appear on stdout (not only on stderr).
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {"name": "Test Author", "publications": []}
+    mock_scholarly.fill.side_effect = RuntimeError("MaxTriesExceeded: Google Scholar blocked")
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "MaxTriesExceeded" in captured.out, (
+        "Error message must be on stdout so the user can see it. "
+        f"Got stdout={captured.out!r}, stderr={captured.err!r}"
+    )
+
+
+def test_main_empty_publications_warns_user(tmp_path, capsys):
+    """When scholarly returns zero publications (e.g. because the profile is
+    blocked), the script should print a clear warning instead of silently
+    producing an empty bib file.
+    """
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {"name": "Test Author", "publications": []}
+    mock_scholarly.fill.side_effect = lambda obj, **kwargs: obj
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+    ):
+        main()
+
+    captured = capsys.readouterr()
+    assert "Publications found: 0" in captured.out, (
+        "Should print 'Publications found: 0' so user notices the issue. "
+        f"Got stdout={captured.out!r}"
+    )
+    # A warning about zero publications should also appear
+    assert "Warning: no publications found" in captured.out, (
+        "Expected a 'Warning: no publications found' message. "
+        f"Got stdout={captured.out!r}"
+    )
 
 
 def test_main_all_pubs_in_bib_before_scholarly_fill(tmp_path):
