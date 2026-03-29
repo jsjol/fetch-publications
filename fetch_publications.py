@@ -702,6 +702,11 @@ def main() -> None:
             pub = scholarly.fill(record["pub"])
             print(" done.")
             time.sleep(args.delay)
+            # Regenerate the BibTeX key now that full author info is available.
+            # The initial key from Phase 1 may have been "unknown..." because the
+            # author field is absent in the basic snippet returned by Scholar.
+            used_keys.discard(record["key"])
+            record["key"] = make_bibtex_key(pub, used_keys)
         except Exception as exc:
             print(f" failed.")
             print(f"  Warning: could not fetch full details: {exc}")
