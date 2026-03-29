@@ -1091,6 +1091,76 @@ def test_make_browser_proxy_generator_firefox_not_headless():
     )
 
 
+def test_handle_captcha2_fixed_copies_cookies_without_secure_kwarg():
+    """After solving a CAPTCHA, the patched _handle_captcha2 must copy browser
+    cookies into the httpx session using only (name, value, domain, path).
+
+    scholarly 1.7.x uses httpx.Client internally.  httpx.Cookies.set() only
+    accepts those four parameters; passing 'secure' (or any other
+    browser-specific key) raises TypeError.  That crash causes scholarly to
+    discard the session and open a fresh one, immediately triggering another
+    CAPTCHA.  This test verifies that our override avoids that crash.
+    """
+    import types as _types
+    from unittest.mock import MagicMock, call
+
+    pg = _make_browser_proxy_generator()
+
+    # --- fake webdriver that looks solved from the start ---
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://scholar.google.com/scholar"
+    mock_driver.get_cookies.return_value = [
+        # A typical Selenium cookie dict: includes 'secure', 'httpOnly', etc.
+        {
+            "name": "GSP",
+            "value": "abc123",
+            "domain": ".google.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "None",
+            "expiry": 9999999999,
+        },
+        {
+            "name": "NID",
+            "value": "xyz",
+            "domain": ".google.com",
+            "path": "/",
+            "secure": False,
+            "httpOnly": True,
+        },
+    ]
+    pg._webdriver = mock_driver
+    pg._get_webdriver = lambda: mock_driver
+
+    # _webdriver_has_captcha() returns False → CAPTCHA is already solved
+    pg._webdriver_has_captcha = MagicMock(return_value=False)
+
+    # --- httpx session with a trackable Cookies.set() ---
+    mock_cookies = MagicMock()
+    mock_session = MagicMock()
+    mock_session.cookies = mock_cookies
+    mock_session.cookies.__iter__ = MagicMock(return_value=iter([]))  # no existing cookies
+    pg._session = mock_session
+
+    # Run: must NOT raise TypeError
+    pg._handle_captcha2("https://scholar.google.com/scholar?q=test")
+
+    # Cookies must be set using ONLY name/value/domain/path
+    expected_calls = [
+        call(name="GSP", value="abc123", domain=".google.com", path="/"),
+        call(name="NID", value="xyz", domain=".google.com", path="/"),
+    ]
+    mock_cookies.set.assert_has_calls(expected_calls, any_order=False)
+
+    # Confirm 'secure' was NEVER passed as a keyword argument
+    for actual_call in mock_cookies.set.call_args_list:
+        assert "secure" not in actual_call.kwargs, (
+            f"'secure' must not be passed to httpx.Cookies.set(). "
+            f"Got kwargs={actual_call.kwargs!r}"
+        )
+
+
 def test_browser_flag_calls_scholarly_use_proxy(tmp_path):
     """When --browser is passed, scholarly.use_proxy must be called so that
     scholarly is configured with a visible-browser CAPTCHA handler.
