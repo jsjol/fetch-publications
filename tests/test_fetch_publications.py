@@ -1000,6 +1000,54 @@ def test_main_latex_downloaded_after_pdfs(tmp_path):
     assert pdf_idx < src_idx
 
 
+def test_main_bibtex_key_uses_author_after_fill(tmp_path):
+    """BibTeX keys must use the first author's last name after scholarly.fill() enriches
+    the publication data.  The initial Phase-1 snippet often lacks the author field,
+    causing keys like 'unknown2024neural'.  Phase 2 must regenerate the key once
+    the full author info is available.
+    """
+    # Simulate a pub whose initial snippet has NO author field (as Scholar returns it)
+    # and whose filled version adds the author.
+    pub_snippet = {"bib": {"title": "Neural Networks Today", "pub_year": "2024"},
+                   "eprint_url": "", "pub_url": "", "public_access": False}
+    pub_filled = {"bib": {"title": "Neural Networks Today", "pub_year": "2024",
+                          "author": "Smith, Alice"},
+                  "eprint_url": "", "pub_url": "", "public_access": False}
+
+    def fill_side_effect(obj, **kwargs):
+        if "sections" in kwargs:
+            return obj  # author-profile fill – pass through
+        return pub_filled
+
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {
+        "name": "Alice Smith",
+        "publications": [pub_snippet],
+    }
+    mock_scholarly.fill.side_effect = fill_side_effect
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST",
+                           "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+    ):
+        main()
+
+    bib_text = (tmp_path / "publications.bib").read_text(encoding="utf-8")
+    # Extract the BibTeX cite-key with a regex: @article{KEY, …} or @misc{KEY, …}
+    import re as _re
+    key_match = _re.search(r"@\w+\{([^,\s]+)", bib_text)
+    assert key_match, f"No BibTeX entry found in:\n{bib_text}"
+    cite_key = key_match.group(1).lower()
+    assert "smith" in cite_key, (
+        f"Expected 'smith' in BibTeX key '{cite_key}', got:\n{bib_text}"
+    )
+    assert "unknown" not in cite_key, (
+        f"BibTeX key must not contain 'unknown'; got key '{cite_key}' in:\n{bib_text}"
+    )
+
+
 def test_main_partial_bibtex_preserved_on_scholar_failure(tmp_path):
     """If scholarly.fill raises on the second publication, the first entry must still be in the BibTeX file."""
     pub1 = _make_fake_pub("Good Paper", year="2021")
