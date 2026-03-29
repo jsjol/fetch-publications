@@ -201,12 +201,18 @@ def _is_pdf_response(resp: requests.Response) -> bool:
 
 _BIORXIV_RE = re.compile(r"(biorxiv|medrxiv)\.org/content/", re.IGNORECASE)
 _OPENREVIEW_RE = re.compile(r"openreview\.net/forum\?", re.IGNORECASE)
-_PMLR_RE = re.compile(r"proceedings\.mlr\.press/.*\.html$", re.IGNORECASE)
+# Match PMLR paper pages ending in .html or .pdf (both occur in practice).
+_PMLR_RE = re.compile(r"proceedings\.mlr\.press/v\d+/[^/]+\.(?:html|pdf)$", re.IGNORECASE)
 _DIVA_RE = re.compile(r"diva-portal\.org/smash/record\.jsf", re.IGNORECASE)
 _PATENTS_RE = re.compile(r"patents\.google\.com/patent/", re.IGNORECASE)
 # Matches the PDF download URL embedded in Google Patents HTML pages.
 _PATENT_PDF_EMBED_RE = re.compile(
     r'https://patentimages\.storage\.googleapis\.com/[^"\'<>\s]+\.pdf',
+    re.IGNORECASE,
+)
+# Matches PDF links in DiVA portal record HTML pages.
+_DIVA_PDF_LINK_RE = re.compile(
+    r'href="(/smash/get/diva2:[^/]+/[^"]+\.pdf)"',
     re.IGNORECASE,
 )
 
@@ -218,7 +224,7 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
     * arXiv abstract → direct PDF URL
     * bioRxiv / medRxiv abstract → ``.full.pdf`` URL (with original as fallback)
     * OpenReview forum page → PDF page
-    * PMLR HTML paper page → PDF URL
+    * PMLR paper page (.html or .pdf) → subdirectory PDF URL, simple PDF URL, HTML fallback
     * DiVA portal record page → FULLTEXT01.pdf URL (with original as fallback)
     * Google Patents page → returned as-is (PDF extracted by download_pdf scraping)
     * All other URLs are returned unchanged (may already be direct PDF links).
@@ -238,9 +244,22 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
         pdf_url = re.sub(r"forum\?", "pdf?", url, flags=re.IGNORECASE)
         return [pdf_url, url]
     if _PMLR_RE.search(url):
-        # Convert .html to .pdf; keep original as fallback
-        pdf_url = re.sub(r"\.html$", ".pdf", url, flags=re.IGNORECASE)
-        return [pdf_url, url]
+        # PMLR canonical PDF is at {version}/{paper_id}/{paper_id}.pdf (subdirectory).
+        # Also try the flat .pdf swap and the .html page as ordered fallbacks.
+        parsed = urlparse(url)
+        stem = re.sub(r"\.(html|pdf)$", "", parsed.path.rsplit("/", 1)[-1], flags=re.IGNORECASE)
+        base_path = parsed.path.rsplit("/", 1)[0]
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        subdir_pdf = f"{origin}{base_path}/{stem}/{stem}.pdf"
+        simple_pdf = f"{origin}{base_path}/{stem}.pdf"
+        html_url = f"{origin}{base_path}/{stem}.html"
+        seen: set[str] = set()
+        result: list[str] = []
+        for u in [subdir_pdf, simple_pdf, html_url]:
+            if u not in seen:
+                seen.add(u)
+                result.append(u)
+        return result
     if _DIVA_RE.search(url):
         # DiVA portal: extract diva2:XXXXXX from the ?pid= query parameter and
         # construct the FULLTEXT01.pdf URL.
@@ -261,8 +280,47 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
 
 def _extract_patent_pdf_url(html: str) -> str:
     """Extract the PDF download URL embedded in a Google Patents HTML page."""
-    m = _PATENT_PDF_EMBED_RE.search(html)
+    # Normalize escaped forward slashes (common in JSON-embedded HTML content).
+    normalized = html.replace("\\/", "/")
+    m = _PATENT_PDF_EMBED_RE.search(normalized)
     return m.group(0) if m else ""
+
+
+def _extract_diva_pdf_url(html: str, record_url: str) -> str:
+    """Extract a full-text PDF URL from a DiVA portal record HTML page."""
+    m = _DIVA_PDF_LINK_RE.search(html)
+    if m:
+        base = re.match(r"(https?://[^/]+)", record_url, re.IGNORECASE)
+        if base:
+            return base.group(1) + m.group(1)
+    return ""
+
+
+def _openreview_api_pdf_url(forum_id: str) -> str:
+    """Try to resolve a PDF URL via the OpenReview API for *forum_id*.
+
+    Returns the full PDF URL string on success, or '' if unavailable.
+    """
+    for api_base in ("https://api2.openreview.net", "https://api.openreview.net"):
+        try:
+            resp = requests.get(
+                f"{api_base}/notes?id={forum_id}",
+                headers=_HEADERS,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            notes = data.get("notes", [])
+            for note in notes:
+                pdf_path = note.get("content", {}).get("pdf", "")
+                if isinstance(pdf_path, str) and pdf_path:
+                    if pdf_path.startswith("/"):
+                        return f"https://openreview.net{pdf_path}"
+                    return pdf_path
+        except Exception:
+            pass
+    return ""
 
 
 def _pdf_url_candidates(pub: dict) -> list[str]:
@@ -347,6 +405,53 @@ def download_pdf(pub: dict, pub_dir: Path, force: bool = False) -> bool:
                         )
                     except requests.RequestException as exc:
                         print(f"    Warning: Patent PDF download failed for {extracted_pdf_url}: {exc}")
+            # For DiVA record pages the response is HTML; scrape for PDF links.
+            if (
+                resp.status_code == 200
+                and _DIVA_RE.search(pdf_url)
+                and "html" in resp.headers.get("Content-Type", "").lower()
+            ):
+                extracted_pdf_url = _extract_diva_pdf_url(resp.text, pdf_url)
+                if extracted_pdf_url:
+                    try:
+                        pdf_resp = requests.get(
+                            extracted_pdf_url, headers=_HEADERS, timeout=60, allow_redirects=True
+                        )
+                        if pdf_resp.status_code == 200 and _is_pdf_response(pdf_resp):
+                            pdf_path = pub_dir / "paper.pdf"
+                            pdf_path.write_bytes(pdf_resp.content)
+                            print(f"    PDF saved → {pdf_path}")
+                            return True
+                        print(
+                            f"    DiVA PDF not available at {extracted_pdf_url} "
+                            f"(status {pdf_resp.status_code}, "
+                            f"content-type: {pdf_resp.headers.get('Content-Type', '')})"
+                        )
+                    except requests.RequestException as exc:
+                        print(f"    Warning: DiVA PDF download failed for {extracted_pdf_url}: {exc}")
+            # For OpenReview pages blocked with 403, try the OpenReview API.
+            if resp.status_code == 403 and re.search(r"openreview\.net", pdf_url, re.IGNORECASE):
+                qs = parse_qs(urlparse(pdf_url).query)
+                forum_id = qs.get("id", [""])[0]
+                if forum_id:
+                    api_pdf = _openreview_api_pdf_url(forum_id)
+                    if api_pdf:
+                        try:
+                            pdf_resp = requests.get(
+                                api_pdf, headers=_HEADERS, timeout=60, allow_redirects=True
+                            )
+                            if pdf_resp.status_code == 200 and _is_pdf_response(pdf_resp):
+                                pdf_path = pub_dir / "paper.pdf"
+                                pdf_path.write_bytes(pdf_resp.content)
+                                print(f"    PDF saved → {pdf_path}")
+                                return True
+                            print(
+                                f"    OpenReview PDF not available at {api_pdf} "
+                                f"(status {pdf_resp.status_code}, "
+                                f"content-type: {pdf_resp.headers.get('Content-Type', '')})"
+                            )
+                        except requests.RequestException as exc:
+                            print(f"    Warning: OpenReview PDF download failed for {api_pdf}: {exc}")
             print(f"    PDF not available at {pdf_url} (status {resp.status_code}, "
                   f"content-type: {resp.headers.get('Content-Type', '')})")
         except requests.RequestException as exc:
