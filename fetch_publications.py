@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
 import logging
 import os
 import re
@@ -201,12 +202,28 @@ def _is_pdf_response(resp: requests.Response) -> bool:
 
 _BIORXIV_RE = re.compile(r"(biorxiv|medrxiv)\.org/content/", re.IGNORECASE)
 _OPENREVIEW_RE = re.compile(r"openreview\.net/forum\?", re.IGNORECASE)
-_PMLR_RE = re.compile(r"proceedings\.mlr\.press/.*\.html$", re.IGNORECASE)
+# Match PMLR paper pages ending in .html or .pdf (both occur in practice).
+_PMLR_RE = re.compile(r"proceedings\.mlr\.press/v\d+/[^/]+\.(?:html|pdf)$", re.IGNORECASE)
 _DIVA_RE = re.compile(r"diva-portal\.org/smash/record\.jsf", re.IGNORECASE)
 _PATENTS_RE = re.compile(r"patents\.google\.com/patent/", re.IGNORECASE)
+# NeurIPS / NIPS proceedings (both legacy papers.nips.cc and proceedings.neurips.cc).
+_NEURIPS_RE = re.compile(
+    r"(?:papers\.nips\.cc|proceedings\.neurips\.cc)/paper",
+    re.IGNORECASE,
+)
+# JMLR paper or proceedings pages (open-access; PDF lives at same path with .pdf extension).
+_JMLR_RE = re.compile(
+    r"jmlr\.org/(?:papers|proceedings/papers)/v\d+/",
+    re.IGNORECASE,
+)
 # Matches the PDF download URL embedded in Google Patents HTML pages.
 _PATENT_PDF_EMBED_RE = re.compile(
     r'https://patentimages\.storage\.googleapis\.com/[^"\'<>\s]+\.pdf',
+    re.IGNORECASE,
+)
+# Matches PDF links in DiVA portal record HTML pages.
+_DIVA_PDF_LINK_RE = re.compile(
+    r'href="(/smash/get/diva2:[^/]+/[^"]+\.pdf)"',
     re.IGNORECASE,
 )
 
@@ -218,7 +235,7 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
     * arXiv abstract → direct PDF URL
     * bioRxiv / medRxiv abstract → ``.full.pdf`` URL (with original as fallback)
     * OpenReview forum page → PDF page
-    * PMLR HTML paper page → PDF URL
+    * PMLR paper page (.html or .pdf) → subdirectory PDF URL, simple PDF URL, HTML fallback
     * DiVA portal record page → FULLTEXT01.pdf URL (with original as fallback)
     * Google Patents page → returned as-is (PDF extracted by download_pdf scraping)
     * All other URLs are returned unchanged (may already be direct PDF links).
@@ -238,9 +255,37 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
         pdf_url = re.sub(r"forum\?", "pdf?", url, flags=re.IGNORECASE)
         return [pdf_url, url]
     if _PMLR_RE.search(url):
-        # Convert .html to .pdf; keep original as fallback
-        pdf_url = re.sub(r"\.html$", ".pdf", url, flags=re.IGNORECASE)
-        return [pdf_url, url]
+        # PMLR canonical PDF is at {version}/{paper_id}/{paper_id}.pdf (subdirectory).
+        # Also try the flat .pdf swap and the .html page as ordered fallbacks.
+        parsed = urlparse(url)
+        stem = re.sub(r"\.(html|pdf)$", "", parsed.path.rsplit("/", 1)[-1], flags=re.IGNORECASE)
+        base_path = parsed.path.rsplit("/", 1)[0]
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        subdir_pdf = f"{origin}{base_path}/{stem}/{stem}.pdf"
+        simple_pdf = f"{origin}{base_path}/{stem}.pdf"
+        html_url = f"{origin}{base_path}/{stem}.html"
+        seen: set[str] = set()
+        result: list[str] = []
+        for u in [subdir_pdf, simple_pdf, html_url]:
+            if u not in seen:
+                seen.add(u)
+                result.append(u)
+        return result
+    if _NEURIPS_RE.search(url):
+        # NeurIPS abstract HTML → paper PDF.
+        # Pattern: .../hash/HASH-Abstract[-Suffix].html → .../file/HASH-Paper[-Suffix].pdf
+        pdf_url = url.replace("/hash/", "/file/")
+        pdf_url = re.sub(r"-Abstract((?:-[^.]+)?)\.html$", r"-Paper\1.pdf", pdf_url,
+                         flags=re.IGNORECASE)
+        if pdf_url != url:
+            return [pdf_url, url]
+        return [url]
+    if _JMLR_RE.search(url):
+        # JMLR paper pages: swap .html → .pdf; keep original as fallback.
+        if url.lower().endswith(".html"):
+            pdf_url = re.sub(r"\.html$", ".pdf", url, flags=re.IGNORECASE)
+            return [pdf_url, url]
+        return [url]
     if _DIVA_RE.search(url):
         # DiVA portal: extract diva2:XXXXXX from the ?pid= query parameter and
         # construct the FULLTEXT01.pdf URL.
@@ -261,8 +306,100 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
 
 def _extract_patent_pdf_url(html: str) -> str:
     """Extract the PDF download URL embedded in a Google Patents HTML page."""
-    m = _PATENT_PDF_EMBED_RE.search(html)
+    # Normalize escaped forward slashes (common in JSON-embedded HTML content).
+    normalized = html.replace("\\/", "/")
+    m = _PATENT_PDF_EMBED_RE.search(normalized)
     return m.group(0) if m else ""
+
+
+def _extract_diva_pdf_url(html: str, record_url: str) -> str:
+    """Extract a full-text PDF URL from a DiVA portal record HTML page."""
+    m = _DIVA_PDF_LINK_RE.search(html)
+    if m:
+        base = re.match(r"(https?://[^/]+)", record_url, re.IGNORECASE)
+        if base:
+            return base.group(1) + m.group(1)
+    return ""
+
+
+def _openreview_api_pdf_url(forum_id: str) -> str:
+    """Try to resolve a PDF URL via the OpenReview API for *forum_id*.
+
+    Returns the full PDF URL string on success, or '' if unavailable.
+    """
+    for api_base in ("https://api2.openreview.net", "https://api.openreview.net"):
+        try:
+            resp = requests.get(
+                f"{api_base}/notes?id={forum_id}",
+                headers=_HEADERS,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            notes = data.get("notes", [])
+            for note in notes:
+                pdf_path = note.get("content", {}).get("pdf", "")
+                if isinstance(pdf_path, str) and pdf_path:
+                    if pdf_path.startswith("/"):
+                        return f"https://openreview.net{pdf_path}"
+                    return pdf_path
+        except Exception:
+            pass
+    return ""
+
+
+def _semantic_scholar_pdf_url(pub: dict) -> str:
+    """Try to find an open-access PDF URL via the Semantic Scholar API.
+
+    Uses DOI-based lookup (precise) when a DOI is available; otherwise
+    falls back to a title search with a similarity confidence check.
+    Returns the PDF URL string on success, or '' if unavailable.
+    """
+    bib = pub.get("bib", {})
+    doi = bib.get("doi", "")
+    title = bib.get("title", "")
+
+    if doi:
+        try:
+            resp = requests.get(
+                f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                params={"fields": "openAccessPdf"},
+                headers=_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                oap = resp.json().get("openAccessPdf") or {}
+                if oap.get("url"):
+                    return oap["url"]
+        except Exception:
+            pass
+
+    if title:
+        try:
+            # limit=1: the top-ranked result is the most likely match; checking
+            # additional results risks returning a PDF for a different paper.
+            resp = requests.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={"query": title, "fields": "openAccessPdf,title", "limit": 1},
+                headers=_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                title_norm = re.sub(r"\W+", " ", title).strip().lower()
+                for paper in resp.json().get("data", []):
+                    result_title = re.sub(r"\W+", " ", paper.get("title", "")).strip().lower()
+                    # Require ≥85% character-sequence similarity to avoid returning
+                    # a PDF for a different paper with overlapping keywords.
+                    similarity = difflib.SequenceMatcher(None, title_norm, result_title).ratio()
+                    if similarity >= 0.85:
+                        oap = paper.get("openAccessPdf") or {}
+                        if oap.get("url"):
+                            return oap["url"]
+        except Exception:
+            pass
+
+    return ""
 
 
 def _pdf_url_candidates(pub: dict) -> list[str]:
@@ -293,6 +430,8 @@ def _pdf_url_candidates(pub: dict) -> list[str]:
             or _BIORXIV_RE.search(pub_url)
             or _OPENREVIEW_RE.search(pub_url)
             or _PMLR_RE.search(pub_url)
+            or _NEURIPS_RE.search(pub_url)
+            or _JMLR_RE.search(pub_url)
             or _DIVA_RE.search(pub_url)
             or _PATENTS_RE.search(pub_url)
             or pub_url.lower().endswith(".pdf")
@@ -347,10 +486,75 @@ def download_pdf(pub: dict, pub_dir: Path, force: bool = False) -> bool:
                         )
                     except requests.RequestException as exc:
                         print(f"    Warning: Patent PDF download failed for {extracted_pdf_url}: {exc}")
+            # For DiVA record pages the response is HTML; scrape for PDF links.
+            if (
+                resp.status_code == 200
+                and _DIVA_RE.search(pdf_url)
+                and "html" in resp.headers.get("Content-Type", "").lower()
+            ):
+                extracted_pdf_url = _extract_diva_pdf_url(resp.text, pdf_url)
+                if extracted_pdf_url:
+                    try:
+                        pdf_resp = requests.get(
+                            extracted_pdf_url, headers=_HEADERS, timeout=60, allow_redirects=True
+                        )
+                        if pdf_resp.status_code == 200 and _is_pdf_response(pdf_resp):
+                            pdf_path = pub_dir / "paper.pdf"
+                            pdf_path.write_bytes(pdf_resp.content)
+                            print(f"    PDF saved → {pdf_path}")
+                            return True
+                        print(
+                            f"    DiVA PDF not available at {extracted_pdf_url} "
+                            f"(status {pdf_resp.status_code}, "
+                            f"content-type: {pdf_resp.headers.get('Content-Type', '')})"
+                        )
+                    except requests.RequestException as exc:
+                        print(f"    Warning: DiVA PDF download failed for {extracted_pdf_url}: {exc}")
+            # For OpenReview pages blocked with 403, try the OpenReview API.
+            if resp.status_code == 403 and re.search(r"openreview\.net", pdf_url, re.IGNORECASE):
+                qs = parse_qs(urlparse(pdf_url).query)
+                forum_id = qs.get("id", [""])[0]
+                if forum_id:
+                    api_pdf = _openreview_api_pdf_url(forum_id)
+                    if api_pdf:
+                        try:
+                            pdf_resp = requests.get(
+                                api_pdf, headers=_HEADERS, timeout=60, allow_redirects=True
+                            )
+                            if pdf_resp.status_code == 200 and _is_pdf_response(pdf_resp):
+                                pdf_path = pub_dir / "paper.pdf"
+                                pdf_path.write_bytes(pdf_resp.content)
+                                print(f"    PDF saved → {pdf_path}")
+                                return True
+                            print(
+                                f"    OpenReview PDF not available at {api_pdf} "
+                                f"(status {pdf_resp.status_code}, "
+                                f"content-type: {pdf_resp.headers.get('Content-Type', '')})"
+                            )
+                        except requests.RequestException as exc:
+                            print(f"    Warning: OpenReview PDF download failed for {api_pdf}: {exc}")
             print(f"    PDF not available at {pdf_url} (status {resp.status_code}, "
                   f"content-type: {resp.headers.get('Content-Type', '')})")
         except requests.RequestException as exc:
             print(f"    Warning: PDF download failed for {pdf_url}: {exc}")
+    # Final fallback: Semantic Scholar open access PDF (tried once after all other
+    # candidates are exhausted to avoid extra API calls on easy-to-download papers).
+    ss_url = _semantic_scholar_pdf_url(pub)
+    if ss_url:
+        try:
+            resp = requests.get(ss_url, headers=_HEADERS, timeout=60, allow_redirects=True)
+            if resp.status_code == 200 and _is_pdf_response(resp):
+                pdf_path = pub_dir / "paper.pdf"
+                pdf_path.write_bytes(resp.content)
+                print(f"    PDF saved (via Semantic Scholar) → {pdf_path}")
+                return True
+            print(
+                f"    Semantic Scholar PDF not available at {ss_url} "
+                f"(status {resp.status_code}, "
+                f"content-type: {resp.headers.get('Content-Type', '')})"
+            )
+        except requests.RequestException as exc:
+            print(f"    Warning: Semantic Scholar PDF download failed for {ss_url}: {exc}")
     return False
 
 
