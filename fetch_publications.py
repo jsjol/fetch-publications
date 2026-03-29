@@ -473,7 +473,16 @@ def main() -> None:
 
     bibtex_entries: list[str] = []
     used_keys: set[str] = set()
+    enriched_pubs: list[dict] = []
 
+    bib_path = output_dir / "publications.bib"
+
+    # ------------------------------------------------------------------
+    # Phase 1: Fetch all publication metadata and build BibTeX.
+    # The BibTeX file is written after every entry so that partial
+    # results are preserved even if the process is interrupted later.
+    # ------------------------------------------------------------------
+    print("\n--- Phase 1: Fetching publication metadata and building BibTeX ---")
     for idx, pub in enumerate(publications, start=1):
         raw_title = pub.get("bib", {}).get("title", "Unknown")
         print(f"\n[{idx}/{len(publications)}] {raw_title[:80]}")
@@ -491,28 +500,44 @@ def main() -> None:
 
         key = make_bibtex_key(pub, used_keys)
         bibtex_entries.append(format_bibtex(pub, key))
+        enriched_pubs.append(pub)
 
-        arxiv_id = extract_arxiv_id(pub)
+        # Write BibTeX after each entry so partial results are not lost
+        bib_path.write_text("\n\n".join(bibtex_entries) + "\n", encoding="utf-8")
 
-        # Decide whether we need a per-paper directory
-        need_dir = (not args.no_pdf and bool(_pdf_url_candidates(pub))) or (
-            not args.no_source and arxiv_id
-        )
-        pub_dir: Path | None = None
-        if need_dir:
+    print(f"\nPhase 1 complete.  BibTeX file: {bib_path}  ({len(bibtex_entries)} entries)")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Download PDFs.
+    # ------------------------------------------------------------------
+    if not args.no_pdf:
+        print("\n--- Phase 2: Downloading PDFs ---")
+        for idx, pub in enumerate(enriched_pubs, start=1):
+            raw_title = pub.get("bib", {}).get("title", "Unknown")
+            candidates = _pdf_url_candidates(pub)
+            if not candidates:
+                continue
+            print(f"\n[{idx}/{len(enriched_pubs)}] {raw_title[:80]}")
             pub_dir = output_dir / make_folder_name(pub)
             pub_dir.mkdir(parents=True, exist_ok=True)
-
-        if not args.no_pdf and pub_dir:
             download_pdf(pub, pub_dir, force=args.force)
 
-        if not args.no_source and arxiv_id and pub_dir:
+    # ------------------------------------------------------------------
+    # Phase 3: Download LaTeX sources from arXiv.
+    # ------------------------------------------------------------------
+    if not args.no_source:
+        print("\n--- Phase 3: Downloading LaTeX sources ---")
+        for idx, pub in enumerate(enriched_pubs, start=1):
+            arxiv_id = extract_arxiv_id(pub)
+            if not arxiv_id:
+                continue
+            raw_title = pub.get("bib", {}).get("title", "Unknown")
+            print(f"\n[{idx}/{len(enriched_pubs)}] {raw_title[:80]}")
+            pub_dir = output_dir / make_folder_name(pub)
+            pub_dir.mkdir(parents=True, exist_ok=True)
             download_arxiv_source(arxiv_id, pub_dir, force=args.force)
             time.sleep(args.delay)
 
-    # Write BibTeX file
-    bib_path = output_dir / "publications.bib"
-    bib_path.write_text("\n\n".join(bibtex_entries) + "\n", encoding="utf-8")
     print(f"\nDone.  BibTeX file: {bib_path}  ({len(bibtex_entries)} entries)")
 
 

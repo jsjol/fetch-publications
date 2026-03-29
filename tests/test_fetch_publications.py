@@ -6,7 +6,7 @@ Run with:  python -m pytest tests/
 import tarfile
 import io
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 
 import pytest
 
@@ -22,6 +22,7 @@ from fetch_publications import (
     _pdf_url_candidates,
     _to_pdf_url,
     _extract_patent_pdf_url,
+    main,
 )
 
 
@@ -847,3 +848,189 @@ def test_download_pdf_patent_no_pdf_link_in_page(tmp_path):
         result = download_pdf(pub, tmp_path)
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# main() – phased execution tests
+# ---------------------------------------------------------------------------
+
+def _make_fake_pub(title: str, year: str = "2023", arxiv_id: str = "") -> dict:
+    """Return a minimal publication dict as returned by scholarly."""
+    eprint_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+    return {
+        "bib": {"title": title, "author": "Doe, J.", "pub_year": year},
+        "eprint_url": eprint_url,
+        "pub_url": eprint_url,
+        "public_access": False,
+    }
+
+
+def _make_mock_scholarly(pubs: list[dict]):
+    """Return a mock for `scholarly.scholarly` whose fill() returns the pub unchanged."""
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {"name": "Test Author", "publications": pubs}
+    # fill() for the author simply returns the author dict with publications intact;
+    # fill() for a publication returns the pub unchanged.
+    mock_scholarly.fill.side_effect = lambda obj, **kwargs: obj
+    return mock_scholarly
+
+
+def test_main_bibtex_written_after_each_pub(tmp_path):
+    """BibTeX file must be written after each publication, not only at the end."""
+    pubs = [
+        _make_fake_pub("First Paper"),
+        _make_fake_pub("Second Paper"),
+    ]
+
+    bib_path = tmp_path / "publications.bib"
+    write_calls: list[int] = []
+
+    original_write_text = Path.write_text
+
+    def tracking_write_text(self, data, **kwargs):
+        if self == bib_path:
+            # Count how many entries have been written so far
+            write_calls.append(data.count("@article"))
+        original_write_text(self, data, **kwargs)
+
+    with (
+        patch("fetch_publications.scholarly", _make_mock_scholarly(pubs)),
+        patch("fetch_publications.time.sleep"),
+        patch.object(Path, "write_text", tracking_write_text),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+    ):
+        main()
+
+    # The file should have been written at least twice: once per publication
+    assert len(write_calls) >= 2
+    # After the first write there should be 1 entry; after the second, 2
+    assert write_calls[0] == 1
+    assert write_calls[1] == 2
+
+
+def test_main_bibtex_contains_all_entries(tmp_path):
+    """BibTeX file must contain an entry for every publication."""
+    pubs = [
+        _make_fake_pub("Alpha Paper", year="2021"),
+        _make_fake_pub("Beta Paper", year="2022"),
+        _make_fake_pub("Gamma Paper", year="2023"),
+    ]
+
+    with (
+        patch("fetch_publications.scholarly", _make_mock_scholarly(pubs)),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+    ):
+        main()
+
+    bib_text = (tmp_path / "publications.bib").read_text(encoding="utf-8")
+    assert "Alpha Paper" in bib_text
+    assert "Beta Paper" in bib_text
+    assert "Gamma Paper" in bib_text
+
+
+def test_main_pdf_downloaded_after_all_bibtex(tmp_path):
+    """All BibTeX entries must be written before any PDF download begins."""
+    arxiv_pub = _make_fake_pub("arXiv Paper", arxiv_id="2301.00001")
+    pubs = [arxiv_pub]
+
+    event_log: list[str] = []
+
+    original_write_text = Path.write_text
+
+    def tracking_write_text(self, data, **kwargs):
+        if self.name == "publications.bib":
+            event_log.append("bib_write")
+        original_write_text(self, data, **kwargs)
+
+    def tracking_download_pdf(pub, pub_dir, force=False):
+        event_log.append("pdf_download")
+        pub_dir.mkdir(parents=True, exist_ok=True)
+        (pub_dir / "paper.pdf").write_bytes(b"%PDF-1.4 fake")
+        return True
+
+    with (
+        patch("fetch_publications.scholarly", _make_mock_scholarly(pubs)),
+        patch("fetch_publications.time.sleep"),
+        patch("fetch_publications.download_pdf", side_effect=tracking_download_pdf),
+        patch("fetch_publications.download_arxiv_source", return_value=False),
+        patch.object(Path, "write_text", tracking_write_text),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path)]),
+    ):
+        main()
+
+    # BibTeX write must come before any PDF download
+    bib_idx = next(i for i, e in enumerate(event_log) if e == "bib_write")
+    pdf_idx = next((i for i, e in enumerate(event_log) if e == "pdf_download"), None)
+    if pdf_idx is not None:
+        assert bib_idx < pdf_idx
+
+
+def test_main_latex_downloaded_after_pdfs(tmp_path):
+    """LaTeX source downloads must happen after all PDF downloads."""
+    arxiv_pub = _make_fake_pub("arXiv Paper", arxiv_id="2301.00001")
+    pubs = [arxiv_pub]
+
+    event_log: list[str] = []
+
+    def tracking_download_pdf(pub, pub_dir, force=False):
+        event_log.append("pdf_download")
+        pub_dir.mkdir(parents=True, exist_ok=True)
+        (pub_dir / "paper.pdf").write_bytes(b"%PDF-1.4 fake")
+        return True
+
+    def tracking_download_source(arxiv_id, pub_dir, force=False):
+        event_log.append("source_download")
+        return True
+
+    with (
+        patch("fetch_publications.scholarly", _make_mock_scholarly(pubs)),
+        patch("fetch_publications.time.sleep"),
+        patch("fetch_publications.download_pdf", side_effect=tracking_download_pdf),
+        patch("fetch_publications.download_arxiv_source", side_effect=tracking_download_source),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path)]),
+    ):
+        main()
+
+    assert "pdf_download" in event_log
+    assert "source_download" in event_log
+    pdf_idx = event_log.index("pdf_download")
+    src_idx = event_log.index("source_download")
+    assert pdf_idx < src_idx
+
+
+def test_main_partial_bibtex_preserved_on_scholar_failure(tmp_path):
+    """If scholarly.fill raises on the second publication, the first entry must still be in the BibTeX file."""
+    pub1 = _make_fake_pub("Good Paper", year="2021")
+    pub2 = _make_fake_pub("Bad Paper", year="2022")
+
+    fill_call_count = 0
+
+    def fill_side_effect(obj, **kwargs):
+        nonlocal fill_call_count
+        # The author fill call (with sections kwarg) passes through unchanged
+        if "sections" in kwargs:
+            return obj
+        fill_call_count += 1
+        if fill_call_count == 2:
+            raise RuntimeError("Simulated Scholar rate-limit error")
+        return obj
+
+    mock_scholarly = MagicMock()
+    mock_scholarly.search_author_id.return_value = {
+        "name": "Test Author",
+        "publications": [pub1, pub2],
+    }
+    mock_scholarly.fill.side_effect = fill_side_effect
+
+    with (
+        patch("fetch_publications.scholarly", mock_scholarly),
+        patch("fetch_publications.time.sleep"),
+        patch("sys.argv", ["fetch_publications.py", "https://scholar.google.com/citations?user=TEST", "--output-dir", str(tmp_path), "--no-pdf", "--no-source"]),
+    ):
+        main()
+
+    bib_text = (tmp_path / "publications.bib").read_text(encoding="utf-8")
+    assert "Good Paper" in bib_text
+    # Bad Paper entry should still be present (created with partial data)
+    assert "Bad Paper" in bib_text
