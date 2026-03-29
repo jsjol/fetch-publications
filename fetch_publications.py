@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
 import logging
 import os
 import re
@@ -205,6 +206,16 @@ _OPENREVIEW_RE = re.compile(r"openreview\.net/forum\?", re.IGNORECASE)
 _PMLR_RE = re.compile(r"proceedings\.mlr\.press/v\d+/[^/]+\.(?:html|pdf)$", re.IGNORECASE)
 _DIVA_RE = re.compile(r"diva-portal\.org/smash/record\.jsf", re.IGNORECASE)
 _PATENTS_RE = re.compile(r"patents\.google\.com/patent/", re.IGNORECASE)
+# NeurIPS / NIPS proceedings (both legacy papers.nips.cc and proceedings.neurips.cc).
+_NEURIPS_RE = re.compile(
+    r"(?:papers\.nips\.cc|proceedings\.neurips\.cc)/paper",
+    re.IGNORECASE,
+)
+# JMLR paper or proceedings pages (open-access; PDF lives at same path with .pdf extension).
+_JMLR_RE = re.compile(
+    r"jmlr\.org/(?:papers|proceedings/papers)/v\d+/",
+    re.IGNORECASE,
+)
 # Matches the PDF download URL embedded in Google Patents HTML pages.
 _PATENT_PDF_EMBED_RE = re.compile(
     r'https://patentimages\.storage\.googleapis\.com/[^"\'<>\s]+\.pdf',
@@ -260,6 +271,21 @@ def _to_pdf_url(url: str, pub: dict) -> list[str]:
                 seen.add(u)
                 result.append(u)
         return result
+    if _NEURIPS_RE.search(url):
+        # NeurIPS abstract HTML → paper PDF.
+        # Pattern: .../hash/HASH-Abstract[-Suffix].html → .../file/HASH-Paper[-Suffix].pdf
+        pdf_url = url.replace("/hash/", "/file/")
+        pdf_url = re.sub(r"-Abstract((?:-[^.]+)?)\.html$", r"-Paper\1.pdf", pdf_url,
+                         flags=re.IGNORECASE)
+        if pdf_url != url:
+            return [pdf_url, url]
+        return [url]
+    if _JMLR_RE.search(url):
+        # JMLR paper pages: swap .html → .pdf; keep original as fallback.
+        if url.lower().endswith(".html"):
+            pdf_url = re.sub(r"\.html$", ".pdf", url, flags=re.IGNORECASE)
+            return [pdf_url, url]
+        return [url]
     if _DIVA_RE.search(url):
         # DiVA portal: extract diva2:XXXXXX from the ?pid= query parameter and
         # construct the FULLTEXT01.pdf URL.
@@ -323,6 +349,59 @@ def _openreview_api_pdf_url(forum_id: str) -> str:
     return ""
 
 
+def _semantic_scholar_pdf_url(pub: dict) -> str:
+    """Try to find an open-access PDF URL via the Semantic Scholar API.
+
+    Uses DOI-based lookup (precise) when a DOI is available; otherwise
+    falls back to a title search with a similarity confidence check.
+    Returns the PDF URL string on success, or '' if unavailable.
+    """
+    bib = pub.get("bib", {})
+    doi = bib.get("doi", "")
+    title = bib.get("title", "")
+
+    if doi:
+        try:
+            resp = requests.get(
+                f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                params={"fields": "openAccessPdf"},
+                headers=_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                oap = resp.json().get("openAccessPdf") or {}
+                if oap.get("url"):
+                    return oap["url"]
+        except Exception:
+            pass
+
+    if title:
+        try:
+            # limit=1: the top-ranked result is the most likely match; checking
+            # additional results risks returning a PDF for a different paper.
+            resp = requests.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={"query": title, "fields": "openAccessPdf,title", "limit": 1},
+                headers=_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                title_norm = re.sub(r"\W+", " ", title).strip().lower()
+                for paper in resp.json().get("data", []):
+                    result_title = re.sub(r"\W+", " ", paper.get("title", "")).strip().lower()
+                    # Require ≥85% character-sequence similarity to avoid returning
+                    # a PDF for a different paper with overlapping keywords.
+                    similarity = difflib.SequenceMatcher(None, title_norm, result_title).ratio()
+                    if similarity >= 0.85:
+                        oap = paper.get("openAccessPdf") or {}
+                        if oap.get("url"):
+                            return oap["url"]
+        except Exception:
+            pass
+
+    return ""
+
+
 def _pdf_url_candidates(pub: dict) -> list[str]:
     """Return a list of URLs to try in order when looking for a PDF.
 
@@ -351,6 +430,8 @@ def _pdf_url_candidates(pub: dict) -> list[str]:
             or _BIORXIV_RE.search(pub_url)
             or _OPENREVIEW_RE.search(pub_url)
             or _PMLR_RE.search(pub_url)
+            or _NEURIPS_RE.search(pub_url)
+            or _JMLR_RE.search(pub_url)
             or _DIVA_RE.search(pub_url)
             or _PATENTS_RE.search(pub_url)
             or pub_url.lower().endswith(".pdf")
@@ -456,6 +537,24 @@ def download_pdf(pub: dict, pub_dir: Path, force: bool = False) -> bool:
                   f"content-type: {resp.headers.get('Content-Type', '')})")
         except requests.RequestException as exc:
             print(f"    Warning: PDF download failed for {pdf_url}: {exc}")
+    # Final fallback: Semantic Scholar open access PDF (tried once after all other
+    # candidates are exhausted to avoid extra API calls on easy-to-download papers).
+    ss_url = _semantic_scholar_pdf_url(pub)
+    if ss_url:
+        try:
+            resp = requests.get(ss_url, headers=_HEADERS, timeout=60, allow_redirects=True)
+            if resp.status_code == 200 and _is_pdf_response(resp):
+                pdf_path = pub_dir / "paper.pdf"
+                pdf_path.write_bytes(resp.content)
+                print(f"    PDF saved (via Semantic Scholar) → {pdf_path}")
+                return True
+            print(
+                f"    Semantic Scholar PDF not available at {ss_url} "
+                f"(status {resp.status_code}, "
+                f"content-type: {resp.headers.get('Content-Type', '')})"
+            )
+        except requests.RequestException as exc:
+            print(f"    Warning: Semantic Scholar PDF download failed for {ss_url}: {exc}")
     return False
 
 

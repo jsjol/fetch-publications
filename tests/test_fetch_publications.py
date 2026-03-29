@@ -25,6 +25,7 @@ from fetch_publications import (
     _extract_patent_pdf_url,
     _extract_diva_pdf_url,
     _openreview_api_pdf_url,
+    _semantic_scholar_pdf_url,
     _make_browser_proxy_generator,
     main,
 )
@@ -456,6 +457,197 @@ def test_pdf_url_candidates_pmlr_pdf_eprint_url():
     pub = {"eprint_url": url, "pub_url": ""}
     cands = _pdf_url_candidates(pub)
     assert "https://proceedings.mlr.press/v221/papillon23a/papillon23a.pdf" in cands
+
+
+# ---------------------------------------------------------------------------
+# _to_pdf_url  (NeurIPS / JMLR conversion)
+# ---------------------------------------------------------------------------
+
+def test_to_pdf_url_neurips_abstract_html():
+    """NeurIPS abstract HTML should be converted to Paper PDF URL."""
+    url = "https://papers.nips.cc/paper/2019/hash/abc123def456-Abstract.html"
+    urls = _to_pdf_url(url, {})
+    assert urls[0] == "https://papers.nips.cc/paper/2019/file/abc123def456-Paper.pdf"
+    assert url in urls
+
+
+def test_to_pdf_url_neurips_abstract_conference_html():
+    """NeurIPS 2022+ Abstract-Conference variant should be converted correctly."""
+    url = "https://proceedings.neurips.cc/paper_files/paper/2022/hash/abc123-Abstract-Conference.html"
+    urls = _to_pdf_url(url, {})
+    assert urls[0] == "https://proceedings.neurips.cc/paper_files/paper/2022/file/abc123-Paper-Conference.pdf"
+    assert url in urls
+
+
+def test_to_pdf_url_neurips_already_pdf():
+    """A NeurIPS URL that is already a PDF should be returned unchanged."""
+    url = "https://papers.nips.cc/paper/2018/file/abc123-Paper.pdf"
+    urls = _to_pdf_url(url, {})
+    assert url in urls
+
+
+def test_to_pdf_url_jmlr_html():
+    """JMLR HTML paper page should be converted to the PDF URL."""
+    url = "http://jmlr.org/papers/v14/author13a.html"
+    urls = _to_pdf_url(url, {})
+    assert urls[0] == "http://jmlr.org/papers/v14/author13a.pdf"
+    assert url in urls
+
+
+def test_to_pdf_url_jmlr_pdf_unchanged():
+    """A JMLR URL already ending in .pdf should be returned as-is."""
+    url = "http://jmlr.org/papers/v14/author13a.pdf"
+    urls = _to_pdf_url(url, {})
+    assert url in urls
+
+
+def test_pdf_url_candidates_neurips_pub_url():
+    """NeurIPS pub_url should be recognised as a known pattern and converted."""
+    url = "https://papers.nips.cc/paper/2019/hash/abc123-Abstract.html"
+    pub = {"eprint_url": "", "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert "https://papers.nips.cc/paper/2019/file/abc123-Paper.pdf" in cands
+
+
+def test_pdf_url_candidates_jmlr_pub_url():
+    """JMLR pub_url should be recognised as a known pattern and converted."""
+    url = "http://jmlr.org/papers/v14/author13a.html"
+    pub = {"eprint_url": "", "pub_url": url}
+    cands = _pdf_url_candidates(pub)
+    assert "http://jmlr.org/papers/v14/author13a.pdf" in cands
+
+
+def test_download_pdf_neurips_converts_url(tmp_path):
+    """download_pdf should try the converted NeurIPS PDF URL first."""
+    abstract_url = "https://papers.nips.cc/paper/2019/hash/abc123-Abstract.html"
+    expected_pdf_url = "https://papers.nips.cc/paper/2019/file/abc123-Paper.pdf"
+    pub = {"eprint_url": abstract_url, "bib": {}}
+
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append(url)
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.headers = {"Content-Type": "application/pdf"}
+        mock.content = b"%PDF-1.4 neurips paper"
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert captured[0] == expected_pdf_url
+    assert (tmp_path / "paper.pdf").exists()
+
+
+# ---------------------------------------------------------------------------
+# _semantic_scholar_pdf_url
+# ---------------------------------------------------------------------------
+
+def test_semantic_scholar_pdf_url_doi_lookup():
+    """DOI-based lookup should return the openAccessPdf URL."""
+    pub = {"bib": {"title": "Some Paper", "doi": "10.1234/abc"}}
+
+    def fake_get(url, **kwargs):
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.json.return_value = {
+            "openAccessPdf": {"url": "https://example.com/paper.pdf", "status": "GREEN"}
+        }
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = _semantic_scholar_pdf_url(pub)
+
+    assert result == "https://example.com/paper.pdf"
+
+
+def test_semantic_scholar_pdf_url_title_fallback():
+    """Title search should be used when DOI is absent."""
+    pub = {"bib": {"title": "Variational Elliptical Processes"}}
+
+    def fake_get(url, **kwargs):
+        mock = MagicMock()
+        if "paper/search" in url:
+            mock.status_code = 200
+            mock.json.return_value = {
+                "data": [
+                    {
+                        "title": "Variational Elliptical Processes",
+                        "openAccessPdf": {"url": "https://example.com/vep.pdf"},
+                    }
+                ]
+            }
+        else:
+            mock.status_code = 404
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = _semantic_scholar_pdf_url(pub)
+
+    assert result == "https://example.com/vep.pdf"
+
+
+def test_semantic_scholar_pdf_url_title_mismatch_rejected():
+    """Title search result with a non-matching title should not be returned."""
+    pub = {"bib": {"title": "A Very Specific Paper Title"}}
+
+    def fake_get(url, **kwargs):
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.json.return_value = {
+            "data": [
+                {
+                    "title": "Completely Unrelated Paper",
+                    "openAccessPdf": {"url": "https://example.com/wrong.pdf"},
+                }
+            ]
+        }
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = _semantic_scholar_pdf_url(pub)
+
+    assert result == ""
+
+
+def test_download_pdf_semantic_scholar_fallback(tmp_path):
+    """When all direct candidates fail, Semantic Scholar should be tried as a fallback."""
+    pub_url = "https://ieeexplore.ieee.org/document/1234567"
+    pub = {
+        "eprint_url": "",
+        "pub_url": pub_url,
+        "public_access": True,
+        "bib": {"title": "My Paper", "doi": "10.1109/test.2019.1234567"},
+    }
+    ss_pdf_url = "https://example.com/mypaper.pdf"
+
+    call_log = []
+
+    def fake_get(url, **kwargs):
+        call_log.append(url)
+        mock = MagicMock()
+        if urlparse(url).netloc == "api.semanticscholar.org" and "DOI:" in url:
+            mock.status_code = 200
+            mock.json.return_value = {"openAccessPdf": {"url": ss_pdf_url}}
+        elif url == ss_pdf_url:
+            mock.status_code = 200
+            mock.headers = {"Content-Type": "application/pdf"}
+            mock.content = b"%PDF-1.4 ss paper"
+        else:
+            # Direct venue URL returns HTML (paywalled)
+            mock.status_code = 200
+            mock.headers = {"Content-Type": "text/html"}
+            mock.content = b"<html>Paywall</html>"
+        return mock
+
+    with patch("fetch_publications.requests.get", side_effect=fake_get):
+        result = download_pdf(pub, tmp_path)
+
+    assert result is True
+    assert ss_pdf_url in call_log
+    assert (tmp_path / "paper.pdf").exists()
 
 
 # ---------------------------------------------------------------------------
